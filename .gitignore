@@ -1,0 +1,7 @@
+# IoTOps/ and custom-telegraf/ are siblings of this repo (one level up —
+# see README), never nested inside it. Defensive only: if either ever gets
+# cloned inside this folder by mistake, don't let this repo track it.
+IoTOps/
+custom-telegraf/
+
+.DS_Store
