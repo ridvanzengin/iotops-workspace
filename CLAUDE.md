@@ -42,3 +42,13 @@ code there.
 - **Why two repos, not one**: Go plugin development is a genuinely different toolchain/CI/release cadence than IoTOps's Python+TS stack — see custom-telegraf's own README for the fuller reasoning.
 - **Why this workspace repo exists, not a merged monorepo**: solves "one Claude Code session needs filesystem access to both repos" without permanently coupling two unrelated build pipelines. Modeled on the `agritwin` project's own root-repo pattern (`~/personal/agritwin`), adapted for sibling (not nested) sub-repos since neither IoTOps nor custom-telegraf needed to move.
 - **Milestone status**: IoTOps v1 (Milestones 0-4) is shipped. Milestone 5 (Automation Engine, v1.1) is in progress — custom-telegraf has a working build toolchain with both plugins as passthrough/logging *stubs* (not real rule/Redis/Celery logic yet); IoTOps's own Automater backend module (CRUD, deploy mechanics, frontend) hasn't been started. See `../IoTOps/docs/development-plan.md` for the authoritative status.
+
+## Next steps
+
+**Read [`ROADMAP.md`](ROADMAP.md) before starting any Milestone 5 work** —
+it has the concrete phased plan (custom-telegraf plugin logic → IoTOps
+backend → IoTOps frontend → beekeeping showcase wiring) and, critically,
+the open design questions that don't have a settled answer yet (whether
+Rule/Condition needs cross-table correlation, the exact config field
+shapes, Redis dedup key mechanics). Update it as steps complete or
+decisions get made — treat it as living state, not a frozen plan.
