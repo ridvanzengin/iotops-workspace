@@ -325,15 +325,29 @@ explicit note on the last one.
 - **Beekeeping showcase seeding (`ensure_automater()`) still not
   started.** Phase D, see below — reconfirming it's still open, not a
   new finding.
-- **Zero automated tests, either repo.** Rule evaluation, dedup/firing-
-  state transitions, TOML generation, Pydantic validation — all verified
-  by hand against the live stack this whole milestone, never by a test
-  suite. `rule.go`'s pure functions (`evaluateCondition`, `firingKey`,
-  etc.) are straightforward to unit test and have none. Python side has
-  pytest + mongomock-motor already set up in the repo, unused for any of
-  this. **Do this one after the Automater/Rule work above ships**, not
-  before — no point writing tests against an API/service shape
-  (`create_rule`/`update_rule`/etc.) that's about to change.
+- ~~Zero automated tests, either repo.~~ **Addressed 2026-07-10**, now
+  that the Automater/Rule shape has settled. `custom-telegraf`:
+  `rule_test.go` (pure functions — condition evaluation, the left-to-right
+  AND/OR fold, tag-then-field lookup, firingKey uniqueness), plus
+  `rule_redis_test.go`/`celery_test.go` using `miniredis` (new dependency)
+  for real match/clear/TTL/multi-rule-independence behavior without a live
+  Redis. `IoTOps`: `tests/backend/automater/` (models, service, API),
+  mirroring `tests/backend/collector/`'s existing pattern (`mongomock-motor`
+  + a fake Docker client, `pytest.ini`/`requirements-dev.txt` were already
+  set up, just unused for this module until now).
+
+  Along the way, found the *existing* `collector`/`plugin` test suites had
+  silently rotted: the `Pipeline` extraction (Phase B, days ago) moved
+  `InputPlugin`/`OutputPlugin` out of `app.collector.models` and changed
+  `generate_toml`'s signature, but nothing had actually run `pytest` since,
+  so 7 pre-existing tests were failing on import/signature errors — fixed
+  as a prerequisite to get a clean baseline before adding anything new.
+
+  Coverage is backend/plugin-only — no frontend tests, and Go coverage
+  stops at `processors.rule`/`outputs.celery`'s own logic (doesn't spin up
+  a real Telegraf binary or exercise `cmd/telegraf`). Good enough to catch
+  the kind of regression that bit `collector`/`plugin` above; not
+  exhaustive.
 
 ## Match/clear flag semantics — DONE 2026-07-09
 
