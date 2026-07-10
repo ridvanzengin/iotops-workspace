@@ -7,86 +7,257 @@ them or start making blind decisions. Update this file as steps complete
 or decisions get made — it should always reflect current reality, not a
 frozen snapshot.
 
-## Next session — Automater/Rule architecture redesign (not started)
+## Multi-table Automaters — DONE 2026-07-10
 
-**The bug that surfaced this**: testing yesterday created two Automaters
-("test", "test temp") in what the user expected to be *one* project's
-automation setup. Both showed up as separate `iotops-automater-*`
-containers. Root cause, confirmed by reading the code: `AutomaterEditor.tsx`
-*always* calls `createAutomater()` — there's no lookup for "does this
-project already have an Automater?" before creating a new one. The
-backend model was actually already right for multiple rules
-(`Automater.rules: list[Rule]` always supported it) — the bug is purely
-that nothing ever reused an existing Automater, and there's no
-independently-addressable Rule resource at all (a Rule today only exists
-as a sub-document inside `Automater.rules`, editable only by replacing
-the whole list via `PUT /api/automater/{id}`). Both stray test automaters
-were manually deleted by the user; nothing to clean up.
+**The bug that surfaced this**: a user testing two rules in the same
+project — one on `env_readings`, one on `device_health` (from the new
+"Rule Testing Sandbox" / "Rule Testing Collector" fixture, see below) —
+attached both to the *same* existing Automater via the UI. The Automater
+had been created with a single mqtt input (whichever table the first rule
+targeted); the second rule's table didn't match it. Two symptoms: (1)
+Dedup Identifiers silently auto-populated from the *wrong* table's tag
+keys (the Automater's existing input's, not the new rule's actual
+table's) with no warning, since the frontend's `derivedInput` correctly
+resolves for existing Automaters but never checked the rule's table
+against it; (2) had the rule been submitted as-is, the deployed
+`telegraf.conf` would have had an mqtt input subscribed to the *first*
+rule's topic only, so the second rule's `table` would never equal any
+incoming metric's name (`processors.rule`'s `evaluateConditions` requires
+`rule.Table == metric.Name()`) — the rule would deploy successfully and
+never fire, silently, forever.
 
-**The target mental model**, agreed 2026-07-09: **Automater** = the
-deployed service (one Telegraf container). **Rule** = an independent
-resource with its own lifecycle, living inside an Automater. They have
-different action sets:
-- Automater: deploy, stop, delete (existing, already implemented,
-  unchanged — stays available as a manual override).
-- Rule: activate, deactivate, delete (new — doesn't exist yet).
+**Decision**: rather than force "one Automater = one table" (which would
+just mean directing the user to create a second Automater), extend
+Automater to support multiple mqtt inputs, mirroring how Collector
+already can. One deployed Telegraf process can now host rules across
+several tables — each table gets its own `[[inputs.mqtt_consumer]]`
+block, same as a Collector's config already looks when it has 2+ mqtt
+inputs. User explicitly chose this over the smaller alternative
+(strictly enforce single-table-per-Automater + block the mismatched
+combination) when asked.
 
-**Lifecycle rules agreed:**
-- First rule created in a project → creates the project's Automater (if
-  none exists yet) *and* the rule (active by default) → Automater is
-  auto-deployed.
-- Additional rule created in the same project → reuses the existing
-  Automater, just adds the rule (active by default) → Automater is
-  auto-*re*deployed to pick up the new rule.
-- Rule deactivated or deleted → if the Automater still has ≥1 active rule,
-  redeploy (to drop the deactivated/deleted rule from the live config);
-  if none remain active, stop the Automater (don't delete it — it can be
-  redeployed later when a rule gets activated again).
-- Editing a rule's fields (conditions, message, etc.) → redeploy, same as
-  above, *only if* the Automater is currently `running` — don't silently
-  flip a deliberately-`stopped` Automater back to running just because
-  its rule config changed underneath it (agreed direction, not yet
-  implemented/confirmed against real usage).
+**Backend** (`app/automater/service.py`): `create_rule`'s existing-
+Automater branch now checks `_has_input_for_table(automater, rule.table)`
+before appending the rule — if no input already covers it, requires
+`collector_id` (same requirement as the new-Automater path) and appends
+a *new* mqtt input (via a shared `_find_mqtt_input(collector, table)`
+helper) rather than rejecting or silently deploying a dead rule. Already-
+covered tables are unaffected — no `collector_id` needed, exactly as
+before. `update_rule` intentionally NOT touched — no UI path lets a rule's
+`table` be edited post-creation yet (only enabled/disabled), so there's
+nothing to retrofit there today; worth revisiting if/when rule-field
+editing ships.
 
-**Backend implementation sketch** (not started):
-- `AutomaterService` gains rule-scoped methods: `create_rule(project_id,
-  rule_payload)` (finds-or-creates the project's one Automater — deriving
-  its `inputs` from the project's Collector's MQTT input and its
-  `outputs` from the static Celery output, same derivation logic
-  `AutomaterEditor.tsx` does client-side today, which should move
-  server-side since Automater creation becomes an implicit side effect
-  rather than a user-facing step), `update_rule(automater_id, rule_id,
-  rule_payload)` (replaces the rule's fields — doubles as activate/
-  deactivate via its `enabled` field and as a full field edit — then
-  redeploys-or-stops per the lifecycle rules above), `delete_rule(automater_id,
-  rule_id)` (same redeploy-or-stop logic).
-- New endpoints: `POST /api/automater/rules`, `PUT
-  /api/automater/{automater_id}/rules/{rule_id}`, `DELETE
-  /api/automater/{automater_id}/rules/{rule_id}`.
-- Deleting an Automater still cascades to its embedded rules (nothing
-  new needed there — they're sub-documents).
+**Frontend** (`AutomaterEditor.tsx`): new `existingAutomaterTables` memo
+(the set of tables an existing Automater's mqtt inputs already cover) and
+`needsNewInputForTable` (true once a table's picked and that Automater
+doesn't already cover it). When an existing Automater is selected, a
+banner now states which tables it already watches. The Collector picker
+— previously shown only for `+ New Automater` — now also appears when
+`needsNewInputForTable`, labeled with the specific table it's being
+picked for (e.g. "Collector (its MQTT input is reused) for
+device_health"), and `collector_id` is included in the submit payload in
+both cases. `derivedInput` now branches: existing-Automater-with-matching-
+input reuses it directly (as before); everything else (new Automater, or
+existing one needing a new table) derives from the chosen Collector,
+same multi-input-disambiguation logic as the Collector-input fix from
+earlier today.
 
-**Frontend implementation sketch** (not started):
-- `AutomaterEditor.tsx` becomes a rule editor — create *and* edit. Note:
-  edit mode doesn't exist anywhere in this app yet (Collector doesn't
-  have it either — checked `CollectorEditor.tsx`, it's create-only, no
-  `useParams`/GET-then-populate/PUT path), so this is genuinely new UI
-  work, not mirroring an existing pattern. Drops the Automater Name/
-  Description fields entirely (Automater becomes implicit/derived, named
-  from its project) — keeps the Project selector (now used to find/
-  imply the target Automater, not to name a new one) plus everything
-  already built for rule metadata + `SchemaConditionBuilder`.
-- `AutomaterList.tsx` becomes automater-rows-with-nested-rules:
-  automater-level deploy/stop/delete stays as today, each rule nested
-  underneath gets activate/deactivate/delete/edit actions.
+**New fixture for exercising this and future rule-condition work**: a
+dedicated "Rule Testing Sandbox" project / "Rule Testing Collector" (2
+mqtt inputs: `env_readings` from `ruletest/env` — tags `sensor_id`/
+`zone`, numeric `temperature`/`pressure`, string field `mode`; and
+`device_health` from `ruletest/device` — tags `device_id`/`location`,
+numeric `battery_pct`/`rssi`, string field `state`) plus a new
+`examples/rule-testing-publisher` (mirrors `examples/mqtt-publisher`'s
+pattern, `docker compose --profile tools up -d rule-testing-publisher`),
+publishing continuously with per-sensor phase-shifted sine waves so
+numeric thresholds cross repeatedly (real match/clear cycling, not a
+one-shot match). Deliberately covers tags + numeric fields + string
+fields across two distinct topics/tables in one Collector, specifically
+so multi-input-Collector and now multi-table-Automater scenarios have
+real data to verify against without touching the beekeeping showcase or
+the original `mqtt-publisher`'s `device_metrics`/`device_status` fixture.
 
-Open items to resolve when picking this up: exact derived Automater
-`name` (e.g. `f"{project.name} Automater"`?), whether `update_rule` should
-really always redeploy on *any* field change (including edits that don't
-affect the deployed config, like `description`) or only when the deployed-
-relevant fields change, and the route shape for the new rule editor page
-(`/automaters/rules/new?project=<id>` for create vs.
-`/automaters/:automaterId/rules/:ruleId/edit` for edit, or similar).
+**Verified live**: attached a second rule (`device_health`, mixed OR
+chain `battery_pct>28 OR rssi>25 OR state=="critical"`) to an existing
+Automater that only had an `env_readings` input. Deployed config grew a
+second `[[inputs.mqtt_consumer]]` block; both rules' matches showed up
+in the real Celery worker logs from the one container, including correct
+match/clear transitions on `device_health`'s `state` field. Also verified
+the UI flow directly (Collector field correctly hidden until a table is
+chosen, then appears scoped to that table; banner correctly lists an
+existing Automater's already-covered tables).
+
+## Per-condition AND/OR chains, tag/field lookup fix, multi-input Collector fix — DONE 2026-07-10
+
+**The ask**: user wanted rules like `a==1 AND b>3 OR c<5` — a genuine
+mixed chain, not one operator applied uniformly across all conditions.
+The "Combine with" UI polish item (below, in yesterday's list) was
+initially built as a single rule-wide selector reusing the old
+`Rule.operator` field; user corrected this — neither the model nor the
+Go plugin supported per-condition joins at all, so this was a real
+three-layer redesign, not just a UI tweak.
+
+**Model change**: `Rule.operator` removed entirely. `Condition` gained
+`join: RuleOperator = "AND"` (Python), `Join string \`toml:"join"\``
+(Go), `join: RuleOperator` (TypeScript) — the join is what connects a
+condition to the *previous* one in the list; the first condition's `join`
+is unused (nothing precedes it). Evaluation is a strict left-to-right
+fold, no operator precedence/parentheses:
+```go
+result := evaluateCondition(rc.Conditions[0], m)
+for _, c := range rc.Conditions[1:] {
+    ok := evaluateCondition(c, m)
+    if strings.EqualFold(c.Join, "OR") { result = result || ok } else { result = result && ok }
+}
+```
+Deliberately no precedence rules (`a AND b OR c` always means
+`(a AND b) OR c`, never `a AND (b OR c)`) — matches how a non-programmer
+reads the chain top-to-bottom, and matches what the UI can express (no
+grouping/parentheses control exists). `SchemaConditionBuilder.tsx` keeps
+`conditions` sorted in schema-column order (not insertion order) since
+fold order is now semantically meaningful, not just cosmetic.
+
+**Bug found and fixed along the way**: `evaluateCondition()` only ever
+called `m.GetField()`, never `m.GetTag()` — a condition on a tag-typed
+column (e.g. `apiary_id`) always evaluated false regardless of the real
+value. Fixed with a `columnValue()` helper mirroring the existing
+tag-then-field lookup `identifierValue()` already used for dedup hashing.
+Verified live with a real mixed AND/OR rule referencing both a tag and a
+numeric field — match/clear oscillated correctly against real
+temperature crossings.
+
+**String field verification** (user's direct follow-up question: "are we
+covering string fields too, not just tags/numbers"): traced
+`equalValues()`'s fallback (`fmt.Sprintf("%v", a) == fmt.Sprintf("%v", b)`
+when both sides fail to parse as numeric) and then verified live against
+a real plain string *field* (`device_status.connection`, values
+`"online"/"offline"/"degraded"` — not a tag, `tag_keys` on that input is
+`["device_id"]` only). Confirmed working: `connection == "offline"`
+correctly fired `flag=match` and cleared (`flag=clear`) on a real
+`offline → degraded` transition observed from live simulator traffic.
+
+**Bug found during that verification, fixed**: `AutomaterService
+.create_rule` derived a new Automater's MQTT input via
+`next(i for i in collector.inputs if i.plugin_type == "mqtt")` — the
+*first* mqtt input, unconditionally. A Collector with more than one mqtt
+input (one per table/topic — the "Test" collector has one for
+`device_metrics`, one for `device_status`) could silently get the wrong
+one: a rule targeting `device_status` got deployed subscribed to
+`device_metrics`'s topic instead, so it could never see matching data.
+Fixed by matching on `configuration.get("name_override") == rule.table`
+instead of taking the first match; raises `InvalidOperationError` if no
+mqtt input on the chosen Collector targets the rule's table. Same fix
+applied to `derivedInput` in `AutomaterEditor.tsx` (only affects the
+`+ New Automater` path — an *existing* Automater's input is already
+fixed at its own creation time, no ambiguity there).
+
+`custom-telegraf/docs/adding-a-plugin.md`'s sample config updated too
+(now shows a real two-condition `AND`/`OR` example), matching the
+in-plugin `sample.conf`.
+
+## Automater/Rule architecture redesign — DONE 2026-07-10
+
+**The bug that surfaced this**: testing on 2026-07-09 created two
+Automaters ("test", "test temp") in what the user expected to be *one*
+project's automation setup. Both showed up as separate
+`iotops-automater-*` containers. Root cause, confirmed by reading the
+code: `AutomaterEditor.tsx` *always* called `createAutomater()` — no
+lookup for "does this project already have an Automater?" before
+creating a new one. The backend model was actually already right for
+multiple rules (`Automater.rules: list[Rule]` always supported it) — the
+bug was purely that nothing ever reused an existing Automater, and there
+was no independently-addressable Rule resource at all.
+
+**Revised the mental model once more before implementing** (2026-07-10):
+the first draft of this plan (below, superseded) assumed *one* Automater
+per project, auto-created implicitly. User pushed back — Collector was
+never restricted to one per project either, so forcing that on Automater
+would have been a new, unjustified inconsistency, not a fix. Landed on:
+**Automater** = a deployed service (one Telegraf container); a project
+can have *as many as the user wants*, for whatever reason (different
+purposes, different Collectors, different TTL/severity profiles,
+whatever). **Rule** = an independent resource with its own lifecycle,
+living inside one Automater. When creating a rule, the user explicitly
+picks which Automater it joins via a dropdown (scoped to the selected
+project) or `+ New Automater`, rather than it being resolved implicitly.
+Creating a new Automater also requires picking which of the project's
+Collectors to derive its MQTT input from (a project can have more than
+one Collector too — the original "first Collector found" simplification
+was dropped in favor of an explicit picker once multiplicity was
+embraced project-wide).
+
+Action sets, as originally agreed and unchanged by the revision:
+- Automater: deploy, stop, delete (unchanged, existing).
+- Rule: activate, deactivate, delete (new).
+
+**Lifecycle rules, as implemented:**
+- Creating a rule against an existing Automater → append it, redeploy.
+- Creating a rule with `+ New Automater` → derive `inputs` from the
+  chosen Collector's MQTT input, static Celery `outputs`, create the
+  Automater with this one rule, deploy.
+- Deactivating/reactivating a rule (`enabled` toggle) or deleting one →
+  redeploy if the Automater still has ≥1 *enabled* rule left, else stop
+  it (skipped entirely — no-op — if it was never deployed in the first
+  place, so `_redeploy_or_stop` can't crash calling `stop()` on a
+  container that never existed). Automaters are never auto-deleted;
+  that's still only a manual, explicit action.
+- Deleting a rule refuses if it's the Automater's *last* rule
+  (`InvalidOperationError`, 400) — "delete the Automater instead" is the
+  explicit path for that, keeping `Automater.rules` non-empty (the
+  Pydantic model's own validator already requires ≥1 rule structurally).
+- One deliberate simplification vs. the original plan: deactivated rules
+  stay *in* the generated config with `enabled = false` rather than being
+  stripped out — `processors.rule`'s `Apply()` already skips disabled
+  rules entirely (see "Evaluate every rule independently" above), so the
+  behavior is identical either way and this needed zero extra filtering
+  logic in `_synthesize_rule_processor`.
+
+**Backend**: `AutomaterService.create_rule(project_id, rule, automater_id,
+automater_name, automater_description, collector_id)` /
+`update_rule(automater_id, rule_id, rule)` / `delete_rule(automater_id,
+rule_id)`, all funneling through a shared `_redeploy_or_stop()` helper.
+New endpoints: `POST /api/automater/rules`, `PUT
+/api/automater/{automater_id}/rules/{rule_id}`, `DELETE
+/api/automater/{automater_id}/rules/{rule_id}`. New
+`InvalidOperationError` exception (400) for the business-rule violations
+above (wrong project, missing collector_id/automater_name, last-rule
+delete) — existing exception types (`EntityNotFoundError`,
+`PluginConfigurationError`, etc.) didn't fit. `AutomaterService` now
+takes a `CollectorRepository` dependency to resolve the chosen Collector's
+input when creating a new Automater.
+
+**Frontend**: `AutomaterEditor.tsx` is now a rule-creation page (not an
+Automater-creation page) — Project dropdown → Automater dropdown
+(existing automaters for that project + `+ New Automater`) → if new,
+Name/Description + a Collector dropdown appear (progressive disclosure)
+→ rule metadata + `SchemaConditionBuilder` unchanged from Phase C.
+`AutomaterList.tsx` is now automater-cards-with-nested-rule-tables:
+automater-level deploy/stop/delete unchanged, each rule row gets
+Activate/Deactivate (toggles `enabled` via the update endpoint) and
+Delete (disabled with a tooltip when it's the last rule). Rule *field*
+editing (conditions/message/etc, not just the enabled toggle) has no UI
+yet — only activate/deactivate/delete, matching what was actually asked
+for; full edit is a later addition if needed, the backend `update_rule`
+endpoint already supports it (it's a full-rule replace, not a
+partial-enabled-only patch).
+
+**Verified live** end-to-end, both via direct API calls and a real
+browser: created a new Automater with rule 1 (auto-deployed, real
+container); added rule 2 to the *same* Automater via the existing-automater
+dropdown path (confirmed still exactly one container, both rules present
+in its deployed config); created a second, fully independent Automater
+in the *same* project (confirmed two separate containers); deactivated
+an Automater's only rule through the real UI (confirmed automater status
+flipped `running` → `stopped`, rule badge flipped `Active` → `Inactive`,
+action buttons swapped correctly); confirmed deleting a last rule is
+rejected with a 400 and a clear message.
+
+**Not done**: rule field editing beyond activate/deactivate (see above);
+whether `update_rule` should redeploy on *every* field change including
+ones that don't affect the deployed config (e.g. `description`) wasn't
+revisited — it still does, unconditionally, same as originally sketched.
 
 ## Open issues / questions — surfaced 2026-07-09, not yet actioned
 
@@ -95,6 +266,20 @@ these are blocking, but all are real gaps worth resolving deliberately
 rather than forgetting about. Not prioritized/sequenced beyond the
 explicit note on the last one.
 
+- **Stale mqtt inputs on multi-table Automaters aren't garbage collected
+  (deliberate, 2026-07-10).** After "Multi-table Automaters" (above), an
+  Automater with rules on two tables that loses its last rule for one of
+  them (deleted, or deactivated) keeps the now-unused mqtt input in its
+  deployed config indefinitely — it'll keep subscribing to that topic
+  with nothing consuming it. Harmless (no incorrect behavior, just a
+  wasted subscription), and deliberately left alone rather than adding
+  input-GC logic to `delete_rule`/`set_rule_enabled` — consistent with the
+  existing "deactivated rules stay in config" simplification (see
+  "Evaluate every rule independently"/Automater-Rule redesign notes
+  above), and re-adding a removed input if the same table's rule comes
+  back would need to re-derive it from a Collector all over again.
+  Revisit only if stale inputs actually become an operational nuisance in
+  practice, not preemptively.
 - **Asymmetric Redis-error handling in `rule.go`.** `trySetFiring` fails
   *open* on a Redis error (treats it as a new match — risk: duplicate
   `match`). `clearFiring` fails *closed* (no clear emitted — risk: a
@@ -337,12 +522,16 @@ None blocking Phase A anymore — all three resolved 2026-07-08 (see
 "Already decided" below for the outcomes and concrete config shapes).
 
 Already decided (don't re-litigate without a reason):
-- **Single-table-per-Automater for v1.1.** A prior-project reference
-  example showed rules spanning two measurement tables
-  (`devices_metrics` AND `devices_status`), but that needs cross-stream
-  state correlation in the Go plugin — materially bigger scope than the
-  documented flat `Condition` model implies. Deferred; not ruled out for
-  a later milestone.
+- **Single-table-per-Rule, still true.** A prior-project reference
+  example showed *one rule's own conditions* spanning two measurement
+  tables (`devices_metrics` AND `devices_status`), but that needs
+  cross-stream state correlation in the Go plugin — materially bigger
+  scope than the documented flat `Condition` model implies. Still
+  deferred; not ruled out for a later milestone. Distinct from
+  "single-table-per-*Automater*", which is no longer true as of
+  2026-07-10 — see "Multi-table Automaters" below: an Automater can now
+  have *several* rules, each pinned to its own table, sharing one
+  deployed Telegraf process (one mqtt input per table it covers).
 - **Config shape: TOML-native nested tables, not a JSON-string blob.**
   Every other IoTOps plugin config already flows Pydantic model → dict →
   `tomli_w.dumps()`, which renders arbitrary nesting with zero
@@ -368,7 +557,6 @@ Already decided (don't re-litigate without a reason):
       enabled = true
       priority = 0
       table = "hive_metrics"    # measurement/hypertable this rule evaluates against
-      operator = "AND"          # or "OR"
       ttl = "5m"                # Go duration string, time.ParseDuration
       identifiers = ["device_id"]  # tag/field names hashed into the dedup key, in order
 
@@ -376,6 +564,7 @@ Already decided (don't re-litigate without a reason):
         column = "temperature"   # column/field name on `table`
         operator = ">"
         value = 36.0
+        join = "AND"              # joins this condition to the *previous* one; ignored on the first condition — see "Per-condition AND/OR chains" below
 
   [[outputs.celery]]
     redis_host = "redis"
@@ -432,8 +621,10 @@ Already decided (don't re-litigate without a reason):
   `rule_event_type` tags and a `rule_message` field onto the metric, which
   flow through to the Celery task automatically (its kwargs already
   include the full tag/field set).
-- Rules are flat (one `operator` AND/OR + a flat list of conditions), not
-  a nested/recursive tree — matches the documented model.
+- ~~Rules are flat (one `operator` AND/OR + a flat list of conditions)~~
+  **Superseded 2026-07-10** — see "Per-condition AND/OR chains" below.
+  Conditions are still a flat list (not a nested/recursive tree), but the
+  AND/OR join is now per-condition, not one rule-wide operator.
 - ~~Rule evaluation is first-match-wins~~ **Superseded 2026-07-09** — see
   "Evaluate every rule independently" above. Every enabled rule on a
   matching table is now evaluated on its own merits; a metric can produce
