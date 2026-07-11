@@ -148,6 +148,32 @@ cleared yet:
   place rather than risking the frontend and any future consumer
   (the activity bar badge, the Panel-overlay feature) reimplementing
   the pairing differently.
+- **Proposed `Occurrence` response shape**, so this isn't left ambiguous:
+  `rule_id`, `rule_name`, `category`, `severity`, `event_type`, `message`
+  (from the match), `identifiers: dict[str, str]` (keys from
+  `identifier_keys`, values from `tags`), `status: "active" | "resolved"`,
+  `matched_at` (the match event's timestamp), `resolved_at: datetime |
+  None` (the clear event's timestamp, if paired). Not a new Mongo
+  collection — derived on read from the existing `events` collection,
+  same source of truth as today.
+- **Live SSE updates need the same pairing logic client-side, not just
+  the initial fetch.** When a `clear` event streams in, the frontend
+  must recognize it completes an *already-rendered* Active occurrence row
+  (same `rule_id` + identifier values) and flip that row to Resolved in
+  place — not append a new row. This means the frontend needs a light
+  version of the same grouping key (`rule_id` + identifier values) to
+  match incoming SSE events against currently-rendered occurrences,
+  which — same as the server-side pairing — depends on `identifier_keys`
+  being present on the `Event`. Get the identifier-keys plumbing landed
+  and working *before* attempting either the server-side pairing or the
+  client-side live reconciliation; both are blocked on it.
+- **Not urgent, but flagging so it isn't a surprise later**: pairing on
+  every read (badge fetch, panel open) means cost grows with total event
+  history, and there's still no retention/TTL policy on the `events`
+  collection (deliberately deferred earlier, see "Events sidebar +
+  persisted event store" below). Fine at current/demo scale; revisit
+  (e.g. cap how far back pairing looks, or add retention) only if it
+  actually gets slow, not preemptively.
 
 **Identifier-keys plumbing gap (found while designing the above)**: an
 `Event`'s `tags` dict today is just the full flat set of everything
