@@ -7,6 +7,275 @@ them or start making blind decisions. Update this file as steps complete
 or decisions get made — it should always reflect current reality, not a
 frozen snapshot.
 
+## Events sidebar polish (activity bar, live delivery, card redesign) — proposed 2026-07-11, not started
+
+**Sequencing: before the Panel-overlay feature below, after the initial
+sidebar (already DONE, see below).** This is "polish the sidebar" from
+that entry's own sequencing note — the user's explicit next step once
+this is committed.
+
+### Activity bar redesign (VSCode-style)
+
+Currently the events sidebar only exists embedded in `DashboardEditor`,
+scoped to that dashboard's `project_id` — reachable only while looking at
+one specific project's dashboard. Redesigning to VSCode's Activity
+Bar + Side Bar pattern:
+
+- **A persistent, always-visible thin icon rail — one icon per Project,
+  plus one for Co-pilot** (Co-pilot is its own icon/panel, not a tab
+  nested inside each project's panel — simpler than the earlier tabbed-
+  panel idea, and doesn't force Co-pilot to only be reachable through a
+  specific project). Reachable from *every* page, not just Dashboard
+  pages — lives in the app's root shell alongside the existing left
+  `Sidebar.tsx` nav, moved out of `DashboardEditor`.
+- **Each project's icon carries a badge — count of currently-unresolved
+  matches** (fires that haven't cleared yet), not a lifetime total. A
+  lifetime count only ever grows and stops meaning anything; an
+  unresolved count resets to 0 when things are healthy and is an actual
+  "something needs attention" signal.
+- **No merged cross-project feed.** Considered and rejected: a single
+  always-cross-project list would satisfy "don't miss things in another
+  project" but loses per-project clarity. Per-project badges, always all
+  visible simultaneously regardless of which (if any) panel is open,
+  solve the same problem better — you see *which* project needs
+  attention without opening anything.
+- **Clicking a project's icon opens the panel scoped to that project**
+  (same content the current `DashboardSidebar` Events tab shows) — this
+  part is unchanged, just now reachable via icon-click from anywhere
+  instead of only inside that project's own dashboards.
+- **Project icons**: no icon/color field exists on the `Project` model.
+  Not adding one — use initials + a deterministically-generated color
+  (hash the project id/name into a color), same fallback-avatar pattern
+  Slack/GitHub use. No schema change.
+
+### Always-on delivery, not per-panel-mount
+
+- **One persistent SSE connection for the whole session**, opened once in
+  the root shell (not opened/closed as `DashboardSidebar` mounts/unmounts
+  per dashboard visit) — needed so every project's badge stays live
+  regardless of which panel is currently open, or whether any is.
+- **Backend: `GET /api/event/stream` drops its required `project_id`,
+  subscribes via Redis `PSUBSCRIBE events:*`** instead of `SUBSCRIBE
+  events:{project_id}`. No change needed on the publish side — the Celery
+  worker keeps publishing to `events:{project_id}` exactly as today; this
+  is purely how the endpoint listens. The single stream feeds both the
+  per-project badge counts and the detail list for whichever project's
+  panel is currently open (client-side filtered by `project_id`).
+- **Reconnect-refetch**: Redis Pub/Sub has no buffering or replay — if a
+  message is published while nobody's subscribed (a reconnect gap), it's
+  simply gone. The underlying event is never at risk (Mongo write happens
+  before the Redis publish in `log_rule_match`, publish is fire-and-forget
+  notification only) but the *live* UI could miss it. Fix: re-fetch `GET
+  /api/event` whenever the `EventSource` reconnects (its `onopen` fires on
+  every reconnect, including the browser's own automatic retry),
+  reconciling against Mongo. Closes the practical gap with no Redis/infra
+  change. (Considered and deferred: MongoDB Change Streams would give
+  truly resumable, gap-free delivery natively, but require converting the
+  currently-standalone `mongo:7` service to a replica set — real infra
+  work for a gap the reconnect-refetch already closes cheaply. Revisit
+  only if reconnect-refetch turns out not to be enough in practice.)
+
+### Event card redesign
+
+Current card: colored by match/clear (flag), shows flag label + relative
+time, rule name, message, `table · severity`. Redesign:
+
+- **Color the card by severity, not match/clear.** Severity ("how much
+  should I care") and match/clear ("is this still true") are orthogonal;
+  overloading one color channel with both forces one to win. Severity is
+  the more useful thing to scan-color for. Low/medium/high/critical →
+  a calm-to-red scale, exact colors are an implementation detail, not
+  something that needed the user's sign-off up front.
+- **Match/clear becomes an explicit badge** ("Active" / "Resolved"),
+  not a color.
+- **Show the rule name** (unchanged) **and the identifiers** (e.g.
+  `hive_id: hive-1`, `sensor_id: env-02`) — currently impossible to tell
+  *which* device/node an event is about without parsing the free-text
+  `message`. See the identifier-keys plumbing gap below — this needs a
+  small model change, not just a frontend template change.
+- **A drawer/expand control on the card** opens the full event detail
+  (raw `tags`/`fields`, exact timestamps, rule/automater/project ids) —
+  summary card stays compact, full detail is one click away rather than
+  cluttering the card itself.
+
+**Identifier-keys plumbing gap (found while designing the above)**: an
+`Event`'s `tags` dict today is just the full flat set of everything
+stamped on the matched metric (`hive_id`, `host`, `topic`, `flag`,
+`matched_rule`, ...) — nothing marks *which* of those keys were the
+Rule's configured `identifiers` versus incidental tags like `host`. That
+mapping only lives in the Rule's own config at evaluation time, not in
+what gets stamped onto the output metric. Same shape of fix as the
+`automater_id`/`project_id` gap fixed for the original sidebar: `rule.go`
+stamps the identifier *names* (their values are already in the regular
+tags/fields under their own keys) as a new tag; `Event` gains
+`identifier_keys: list[str]`, populated from it. Keeps `Event`
+self-contained — rendering a card never needs a live lookup back to a
+Rule that might since have changed shape or been deleted. Cross-repo
+again, same pattern as before.
+
+**Not started.**
+
+## Events-as-overlay on Panel charts — proposed 2026-07-11, not started
+
+**Sequencing: after the events sidebar is polished, not before.** Captured
+now so the design isn't lost, not because it's next up.
+
+Goal: let a Panel (any chart type — line/bar/scatter) show events as a
+second layer on top of the telemetry it already charts (e.g. a temperature
+line with dots marking when `swarm-alert` fired), without the user having
+to hand-build a separate events series/query. Design settled through
+discussion, in order:
+
+- **Not a single toggle ("show all events") — a multi-select dropdown of
+  specific Rules**, in the panel header next to the chart-type control
+  (an independent control, not a 4th option inside that radio group — a
+  bar chart can have events overlaid just as much as a line chart can).
+  Selecting which Rules' events overlay which panel is an explicit user
+  choice per panel, not automatic.
+- **Selection unit is Rule, not `event_type`/`category`.** Those are
+  free-text fields nothing enforces consistency on; grouping by them
+  could silently lump together rules the user never meant to combine.
+  Rule is the one thing in the model with real identity (id, lifecycle,
+  actual conditions). Confirmed by the user: more than one Rule can point
+  at the same table, and they want to be able to pick among them
+  individually, not just "everything on this table."
+- **Dropdown lists every Rule in the project, not just ones matching the
+  panel's own table(s).** An earlier idea to auto-filter the dropdown to
+  "rules whose table matches this panel's query" doesn't hold up — a
+  Panel's query can join multiple tables, so there's no single table to
+  match against. Showing every Rule and letting the user pick is simpler
+  and doesn't silently hide a relevant Rule because of a join the
+  filtering logic didn't understand.
+- **Events stay in Mongo — this doesn't change the earlier DB call.**
+  Overlaying events on a chart is the same problem Grafana solves with
+  *annotations*: stored in Grafana's own config DB (not the time-series
+  backend), fetched via a separate call, rendered as a distinct layer —
+  not merged into the same SQL result as the metric data. `GET
+  /api/event` needs a time-range filter (`since`/`until`, reusing
+  whatever range the panel's own telemetry query already resolved) so the
+  chart can ask "which events fell in this window" the same way it asks
+  TimescaleDB for telemetry in that window, as a second fetch merged
+  client-side — not a second column in one unified query. The tradeoff
+  (two fetches instead of one) is small and doesn't come close to
+  justifying re-opening the Mongo/TimescaleDB line for exact-point,
+  low-volume data that needs no bucketing/aggregation.
+- **Open, needs a decision before implementation starts**: should the
+  selected Rule set for a panel's overlay be saved on the `Panel` model
+  itself (e.g. a new `event_rule_ids: list[UUID]` field) so it's part of
+  the dashboard's saved, shared definition — or just local/session UI
+  state that resets per viewer? Recommendation: persist it on `Panel`,
+  same reasoning as chart type or time range defaults already being part
+  of what a saved dashboard shows, not something every viewer reconfigures.
+
+**Not started.**
+
+## Events sidebar + persisted event store — DONE 2026-07-10
+
+Previously `app/automater/tasks.py`'s `log_rule_match` only logged each
+match/clear event to stdout. Now persisted to Mongo, streamed live to a
+project-scoped, tabbed sidebar (Events / Co-pilot) on every Dashboard, plus
+a summary widget on the Overview page. User confirmed all open questions
+before implementation: Mongo (not TimescaleDB) for storage, project-scoped
+sidebar shared across a project's dashboards (not a cross-project root-level
+nav item — an earlier same-day recommendation, superseded), and **Server-
+Sent Events** for live updates (not polling) — decided once the user
+mentioned a planned AI co-pilot would share the same sidebar as a second
+tab, which needs push-style updates anyway.
+
+**Cross-repo attribution gap found before implementation could start**: the
+data flowing through `outputs.celery` today (`measurement`/`tags`/`fields`/
+`timestamp`) carried `matched_rule` (the rule's *name*), `flag`,
+`rule_category`/`rule_severity`/`rule_event_type` — no `rule_id`, no
+`automater_id`, no `project_id` anywhere. Without those, an event couldn't
+be attributed to a project (the whole point of the sidebar) and "counts per
+rule" would double-count same-named rules. Fixed in both repos:
+
+- **custom-telegraf**: `RuleConfig` gains `AutomaterID`/`ProjectID`
+  (`toml:"automater_id"`/`"project_id"`), required in `Init()` alongside the
+  existing `ID`/`Table` checks. `annotate()` now also stamps
+  `matched_rule_id` (`rc.ID`), `automater_id`, `project_id` tags — `Name`
+  stays for humans reading raw metric output, `matched_rule_id` is what
+  the Celery consumer actually keys attribution on (Name isn't required
+  unique — same reasoning as `firingKey`'s own rule-ID scoping).
+  `sample.conf`/`docs/adding-a-plugin.md` updated; new tests
+  (`TestApply_StampsRuleAndAttributionTags`, `TestInit_RejectsMissingAttribution`).
+- **IoTOps**: new `DeployedRule(Rule)` model (`app/plugin/processors/rule.py`)
+  adds `automater_id`/`project_id` — deliberately *not* fields on the
+  persisted `Rule` domain model itself, since a Rule's container is already
+  implicit via `Automater.rules` and duplicating it onto every stored Rule
+  document would be redundant. `AutomaterService._synthesize_rule_processor`
+  now takes the whole `Automater` (was just `rules: list[Rule]`) and wraps
+  each rule in a `DeployedRule` at TOML-generation time, from the Automater
+  being deployed — never user input.
+
+**New `app/event/` module**: `Event` Pydantic model (Mongo-stored, see the
+Mongo-vs-TimescaleDB reasoning above — still holds, restated briefly:
+discrete variably-shaped documents, inherently low volume thanks to
+match/clear+TTL dedup, query patterns are recent-first-feed/filter/paginate
+not range-aggregation). `EventRepository` is async-only (motor, for FastAPI)
+with a `to_document`/`_from_document` pair — deliberately public
+(`to_document`) so `app/automater/tasks.py`'s *sync* writer (a Celery task
+can't share an async client) reuses the exact same document shape instead
+of duplicating it. `EventService` + `app/event/api.py`: `GET /api/event`
+(list, optional `project_id`/`limit`), `GET /api/event/counts` (grouped by
+project+rule, counts *matches* only — a match/clear pair is one incident),
+`GET /api/event/stream` (SSE via `sse-starlette`, subscribes to a
+per-project Redis pub/sub channel). New deps: `sse-starlette`, plus
+`pymongo`/`redis` pinned explicitly now that `tasks.py` imports them
+directly (both were already transitive via motor/celery[redis], versions
+match what those already resolve — not a new constraint).
+
+`log_rule_match` now builds an `Event` from the tags/fields already
+arriving (nothing new to compute), writes it to Mongo via a module-level
+sync `pymongo.MongoClient` + `redis.Redis` (deliberately separate from the
+rest of the app's async motor/redis clients — a Celery task runs sync,
+can't share an async client without spinning up an event loop per call),
+and `PUBLISH`es to `events:{project_id}` — fire-and-forget, since the event
+is already durably in Mongo either way if nobody's subscribed.
+
+**Frontend**: `DashboardSidebar.tsx` — Events tab (live feed via
+`EventSource`, unread-count badge on the tab using a ref to avoid
+resubscribing on every tab switch) + a "coming soon" Co-pilot tab
+placeholder. Rendered by `DashboardEditor.tsx`, scoped by
+`dashboard.project_id`. `Home.tsx` (Overview) rewritten from a bare
+health-check page into event counts per project per rule + latest events,
+each linking to the corresponding project's dashboard (first/only one, or
+its dashboard list if it has several — doesn't matter which, since every
+dashboard in a project shows the identical sidebar). Also widened `.page`
+from a centered 960px column to full width (was only ever used by `Home`,
+so no other page affected) per user request once the new widget made the
+old narrow centered layout look sparse.
+
+**Bug found and fixed along the way**: the *existing* `list`-name-shadowing
+gotcha (see `AutomaterService._synthesize_rule_processor`'s own comment)
+bit `EventRepository`/`EventService` too — a `counts_by_rule` method
+defined *after* a method literally named `list` had its `list[...]` return
+annotation resolve against the class namespace instead of the builtin.
+Fixed the same way: `counts_by_rule` defined first in both classes.
+
+**Verified live end-to-end**: real MQTT data → Go plugin stamps new
+attribution tags (confirmed via `docker exec ... cat telegraf.conf` showing
+`automater_id`/`project_id` in the deployed config, and real match/clear log
+lines carrying them) → Celery worker persists to Mongo (confirmed via
+`mongosh`) and publishes → `GET /api/event`/`/api/event/counts` return
+correct data → `curl -N /api/event/stream` streams real live events → in an
+actual browser, the DashboardSidebar's unread badge correctly counted
+events arriving while on the Co-pilot tab, and switching back showed the
+newest event first with correct match/clear color-coding. 32 new tests
+across both repos (17 Python: Event/DeployedRule models, EventRepository,
+`log_rule_match`'s Mongo write + Redis publish + missing-attribution
+guard, event API; 5 Go: attribution-tag stamping, missing-attribution
+`Init()` rejection).
+
+**Not done / deliberately deferred**: the Co-pilot tab itself (placeholder
+only — scope, conversation model, and what it's allowed to see/do are all
+still open, tracked separately, not blocking this). No automated test for
+the SSE endpoint itself (verified manually via `curl -N` and a real browser
+instead — SSE + FastAPI TestClient's sync client don't mix well). No
+retention/TTL policy on the `events` Mongo collection (grows unbounded for
+now, per "retention as you wish" — revisit if it becomes a real problem,
+not preemptively).
+
 ## Multi-table Automaters — DONE 2026-07-10
 
 **The bug that surfaced this**: a user testing two rules in the same
@@ -322,9 +591,6 @@ explicit note on the last one.
   real outage (the "action failed" deploy bug from 2026-07-08, deploy
   500'd because the image didn't exist). Fine for local dev, a real gap
   before this goes anywhere beyond one machine.
-- **Beekeeping showcase seeding (`ensure_automater()`) still not
-  started.** Phase D, see below — reconfirming it's still open, not a
-  new finding.
 - ~~Zero automated tests, either repo.~~ **Addressed 2026-07-10**, now
   that the Automater/Rule shape has settled. `custom-telegraf`:
   `rule_test.go` (pure functions — condition evaluation, the left-to-right
@@ -512,11 +778,11 @@ the `Pipeline` extraction.
 
 Phase C (frontend) is also done — see below. The real Python `celery`
 worker (originally the last open item here) is done too, see the
-"Full production loop verified live" note above. **Not yet done**: the
-beekeeping showcase's own `ensure_automater()` seeding step (Phase D) —
-today's live verification reused a manually-created test Automater
-against the existing beekeeping simulator data, not a seeded showcase
-fixture.
+"Full production loop verified live" note above. That day's live
+verification reused a manually-created test Automater against the
+existing beekeeping simulator data, not a seeded-into-the-showcase
+fixture — wiring a real Rule into the beekeeping showcase itself is out
+of scope (dropped from this roadmap, not just deferred).
 
 One gotcha surfaced during verification, worth remembering for the
 frontend rule builder: Telegraf's JSON input parser silently drops any
@@ -663,8 +929,9 @@ Already decided (don't re-litigate without a reason):
 3. ~~Update `docs/adding-a-plugin.md`'s config-shape section~~ Done.
 
 Verified end-to-end against real Mosquitto + Redis (see "Where things
-actually stand" above); not yet verified against a real Python `celery`
-worker (Phase D).
+actually stand" above) and, later the same day, against a real Python
+`celery` worker too (see "Full production loop verified live" in that
+same section).
 
 ## Phase B — `IoTOps`: Automater backend module — DONE 2026-07-08
 
@@ -768,16 +1035,3 @@ Already decided (don't re-litigate without a reason):
   every other field left at its `RuleProcessorConfig`/`CeleryOutputConfig`
   schema default.
 
-## Phase D — Beekeeping showcase integration
-
-1. `examples/beekeeping-simulator/seed.py` gains an `ensure_automater()`
-   step (idempotent, same lookup-by-name-and-reuse pattern as the
-   existing Project/Collector/Dashboard steps): one Automater, MQTT input
-   on `beekeeping/hive`, one Rule named `"swarm-alert"` (`temperature >
-   36` — chosen because the simulator's existing random walk crosses that
-   threshold on its own, so the demo fires from genuinely-simulated
-   conditions, not a forced spike).
-2. Verify end-to-end: real hive data triggers a real Celery task, visible
-   in `celery-worker` logs, matching the milestone's acceptance criteria
-   verbatim ("Beekeeping showcase demonstrates a live swarm-alert
-   triggered by simulated conditions").
