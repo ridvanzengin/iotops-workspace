@@ -98,6 +98,57 @@ time, rule name, message, `table · severity`. Redesign:
   summary card stays compact, full detail is one click away rather than
   cluttering the card itself.
 
+### List model: occurrences, not raw events — settled 2026-07-11
+
+The events list is **not** a flat historical log of every `match`/`clear`
+`Event` document (which would show two rows per incident, and keep
+growing forever). It's **one row per occurrence**, where an occurrence is
+a paired-up `(match, clear)` — or a lone trailing `match` if it hasn't
+cleared yet:
+
+- **An occurrence spans exactly one match and, once it happens, its one
+  corresponding clear.** Once closed (paired with a clear), that row is
+  final/historical — it does not get reopened. If the same Rule fires
+  again for the same identifiers *after* clearing, that's a **new**
+  occurrence (a new row), not the old one flipping back to Active.
+  Concretely: fires, clears, fires again → **two rows**, one Resolved,
+  one Active — confirmed explicitly by the user, not an inference.
+- **Pairing is straightforward because of how `rule.go` already behaves,
+  not something that needs new dedup logic.** A repeat match while an
+  occurrence is still open is *suppressed at the plugin level*
+  (`trySetFiring` returns false, `Apply` emits nothing — see rule.go) —
+  no `Event` document is ever written for a suppressed repeat. So the raw
+  `Event` stream for one `(rule_id, identifier values)` group is already
+  a clean alternating sequence: match, clear, match, clear, .... Building
+  occurrences from it is just: group by `(rule_id, identifier values)`,
+  sort by `matched_at`, walk the sequence pairing each match with the
+  next clear after it. A trailing unpaired match (most recent event in
+  the group has no following clear) is the group's one currently-open
+  occurrence.
+  - Grouping by identifier *values* (not just `rule_id`) is required —
+    two different devices firing the same Rule are different occurrences
+    happening in parallel, e.g. `hive-1`'s swarm-alert and `hive-2`'s are
+    unrelated to each other. This is the same reason `identifier_keys`
+    needs to land on `Event` — you can't group by "the identifier values"
+    without first knowing which tags those are.
+- **Badge counts follow from this directly, no separate definition
+  needed**: a per-rule badge is the count of occurrences (not raw events)
+  for that rule; the "Unresolved" badge is the count of currently-open
+  occurrences (trailing unpaired matches) across the whole project;
+  the activity bar's per-project badge is the same unresolved count,
+  just aggregated across all of that project's rules instead of shown
+  per-rule.
+- **Where this logic lives**: server-side, as a new `EventRepository`
+  method (e.g. `list_occurrences`/`unresolved_counts_by_project`) —
+  not something to reconstruct client-side from a raw `GET /api/event`
+  response. Doing the pairing in a Mongo aggregation pipeline (or
+  in Python over a sorted query result) keeps the frontend simple
+  (renders occurrence rows it's handed, doesn't need to know how
+  they were derived) and keeps the definition of "occurrence" in one
+  place rather than risking the frontend and any future consumer
+  (the activity bar badge, the Panel-overlay feature) reimplementing
+  the pairing differently.
+
 **Identifier-keys plumbing gap (found while designing the above)**: an
 `Event`'s `tags` dict today is just the full flat set of everything
 stamped on the matched metric (`hive_id`, `host`, `topic`, `flag`,
