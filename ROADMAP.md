@@ -113,6 +113,48 @@ self-contained — rendering a card never needs a live lookup back to a
 Rule that might since have changed shape or been deleted. Cross-repo
 again, same pattern as before.
 
+### Implementation gotchas, worth knowing before starting (not yet hit, spotted by reasoning through the design)
+
+- **`PSUBSCRIBE` messages have `type == "pmessage"`, not `"message"`.**
+  `app/event/api.py`'s `_subscribe` generator currently filters on
+  `message["type"] != "message"` (correct for the current plain
+  `SUBSCRIBE`). Switching to `PSUBSCRIBE events:*` without also updating
+  that check would silently drop every event — the filter would never
+  match anything, and the stream would look "connected but dead" with no
+  error anywhere. Update the type check alongside the subscribe call, not
+  as an afterthought.
+- **"Unresolved count" for a project's activity-bar badge is *not*
+  `GET /api/event/counts`** — that endpoint counts every match ever
+  recorded (lifetime total), not currently-still-firing ones. Computing
+  "unresolved" needs grouping by (`rule_id` + the actual identifier
+  *values*, not just rule) and checking whether the most recent event in
+  each group is a `match` not yet followed by a `clear` — which is why
+  this depends on the `identifier_keys` addition above landing first (you
+  can't group by "the identifier values" without first knowing which tags
+  those are). This is new aggregation logic, not a reuse of what already
+  exists — plan for a new repository method (e.g.
+  `EventRepository.unresolved_counts_by_project`), not a frontend-only
+  change.
+- **The always-on SSE connection needs a shared home, not per-component
+  ownership.** Right now `DashboardSidebar.tsx` opens/closes its own
+  `EventSource` in a `useEffect` tied to its own mount/unmount. A
+  single session-wide connection that feeds both the activity bar's
+  per-project badges *and* whichever project's panel happens to be open
+  means introducing a React context/provider at the app-shell level that
+  owns the one `EventSource` and distributes updates — genuinely new
+  architecture, not a small edit to the existing hook.
+- **No new external dependencies needed for any of this** — `PSUBSCRIBE`
+  is a normal Redis command already supported by the `redis` client
+  already in use, the activity bar/context/card-redesign work is all
+  React+CSS. Rebuilds should stay cache-friendly (no `requirements.txt`/
+  `go.mod`/`package.json` changes expected) — worth confirming that stays
+  true given the hotspot/bandwidth constraint, rather than assuming.
+- **Project icon colors**: no product decision needed, just pick an
+  approach — hash the project id into an index over a small fixed palette
+  (7-10 colors distinct from the existing severity scale), same
+  fallback-avatar pattern as Slack/GitHub. Doesn't need the user's input,
+  just needs *an* implementation.
+
 **Not started.**
 
 ## Events-as-overlay on Panel charts — proposed 2026-07-11, not started
