@@ -7,7 +7,7 @@ them or start making blind decisions. Update this file as steps complete
 or decisions get made — it should always reflect current reality, not a
 frozen snapshot.
 
-## Events sidebar polish (activity bar, live delivery, card redesign) — proposed 2026-07-11, not started
+## Events sidebar polish (activity bar, live delivery, card redesign) — DONE 2026-07-11
 
 **Sequencing: before the Panel-overlay feature below, after the initial
 sidebar (already DONE, see below).** This is "polish the sidebar" from
@@ -232,7 +232,99 @@ again, same pattern as before.
   fallback-avatar pattern as Slack/GitHub. Doesn't need the user's input,
   just needs *an* implementation.
 
-**Not started.**
+**Implemented in five phases, in the order laid out above** (identifier-keys
+plumbing → server-side occurrence-pairing → card redesign → client-side SSE
+reconciliation → SSE/context restructuring + activity bar), each verified
+live against the real running stack before moving to the next.
+
+**One deviation from the proposed `Occurrence` shape, decided before
+implementing Phase 2**: extended it with `automater_id`, `project_id`,
+`tags`, `fields` (all taken from the match event) beyond the originally-
+proposed minimal fields — the card drawer needs raw tags/fields and
+attribution ids, and baking them into the list response avoids a second
+lazy-fetch endpoint (plus the route-ordering gotcha that would come with
+it) for a payload-size concern this feature has already deprioritized
+elsewhere (pairing cost, retention). Not left ambiguous — checked with the
+user before implementing.
+
+**custom-telegraf**: `rule.go`'s `annotate()` now stamps an
+`identifier_keys` tag (comma-joined `rc.Identifiers` names, omitted when a
+rule has none configured) alongside the existing attribution tags. No
+`outputs/celery` change needed — confirmed it forwards `m.Tags()` wholesale.
+New tests `TestApply_StampsIdentifierKeysTag` /
+`TestApply_NoIdentifierKeysTagWhenRuleHasNoIdentifiers` in
+`rule_redis_test.go`. `sample.conf`/`docs/adding-a-plugin.md` updated.
+
+**IoTOps backend**: `Event` gains `identifier_keys: list[str]`;
+`app/automater/tasks.py`'s `log_rule_match` parses it from the tag.
+`app/event/repository.py` gains `_pair_occurrences` (module-level, shared
+by both new methods) plus `EventRepository.list_occurrences`/
+`.unresolved_counts_by_project` — grouping mirrors `rule.go`'s `firingKey`
+exactly, including the empty-identifiers branch (shares one group across
+every instance of a rule with none configured). New `Occurrence`/
+`OccurrenceStatus`/`ProjectUnresolvedCount` models; new endpoints `GET
+/api/event/occurrences`, `GET /api/event/unresolved-counts`. `GET
+/api/event/stream` dropped its required `project_id`, switched to
+`PSUBSCRIBE events:*` (with the `_subscribe` type filter correctly updated
+to `"pmessage"`, per the gotcha flagged ahead of time). 12 new backend
+tests across `test_models.py`/`test_repository.py`/`test_api.py`/
+`test_tasks.py` (243 total, all passing) — including a direct test of the
+confirmed repeat-fire semantics (match → clear → match on the same
+rule/identifiers produces two rows, one resolved, one active).
+
+**IoTOps frontend**: new `OccurrenceCard.tsx` (severity-colored left
+border via new `--severity-{low,medium,high,critical}` CSS variables,
+Active/Resolved status pill, identifier chips, expandable detail drawer)
+replaces the old flag-colored `EventRow`. New `utils/occurrences.ts`
+(`reconcileOccurrence`) does the client-side match/clear reconciliation
+against rendered rows, keyed the same way as the backend's pairing. New
+`context/EventsContext.tsx` (`EventsProvider`/`useEvents`) owns the one
+session-wide `EventSource`, per-project unresolved counts (seeded from
+`/unresolved-counts`, updated incrementally as events stream in, corrected
+via reconnect-refetch on the `EventSource`'s `onopen`), and the occurrence
+list for whichever project's panel is open. New `ActivityBar.tsx` (icon
+rail, initials + id-hashed color, unresolved-count badges, separate
+Co-pilot icon — not nested as a tab) and `EventsPanel.tsx` (renders
+whichever panel is active) mounted in `App.tsx` alongside the existing
+`Sidebar`, wrapping `<Routes>` so the activity bar/panel/SSE connection
+persist across every page, not just Dashboard pages. Old
+`DashboardSidebar.tsx`/`.css` deleted (fully superseded);
+`DashboardEditor.tsx` no longer mounts a per-dashboard sidebar.
+
+**Verified live end-to-end** against the real beekeeping stack (real
+Automater, real Celery worker, real browser via Playwright): confirmed
+`identifier_keys` flowing through Go → Celery → Mongo
+(`tags={'identifier_keys': 'apiary_id,hive_id', ...}` in real worker logs);
+`GET /api/event/occurrences` correctly pairing real match/clear events,
+including the same rule/identifiers firing twice producing two separate
+rows (one resolved, one active) from real data, not just the test suite;
+the redesigned card rendering correctly in both light and dark themes;
+a card flipping Active → Resolved live in the browser via SSE without a
+duplicate row, and a genuinely new fire correctly prepending a new row
+while the prior resolved row for the same rule/identifiers stayed as
+history; the activity bar visible and its badges live-updating across
+client-side route changes to non-Dashboard pages (Collectors, Automater);
+exactly one persistent `/api/event/stream` connection for the whole
+session confirmed via network request interception (not reopened by
+route changes or by opening/closing panels); the Co-pilot icon opening
+its own separate placeholder panel, distinct from any project's panel.
+
+**Incidentally hit and worked around, not a regression**: the
+already-documented "Unexplained ~90-minute MQTT reconnect gap" (see
+"Where things actually stand" below) recurred during this session's live
+verification -- the Automater's `inputs.mqtt_consumer` had silently
+stopped receiving despite the Collector on the same topic continuing to
+ingest fine. Same remedy as before: `docker restart` on the Automater
+container. Still not root-caused; still stock Telegraf, not custom code.
+
+**Not done / deliberately deferred**: no automated test for the
+`PSUBSCRIBE`-based `/stream` endpoint itself (same SSE + `TestClient`
+limitation as before -- verified manually/live instead). No frontend
+component tests for `OccurrenceCard`/`ActivityBar`/`EventsPanel` (no
+frontend test framework configured in this repo, consistent with the rest
+of the codebase). `Home.tsx`'s "Latest events" widget intentionally left
+on the raw `Event`/flag-colored styling, not switched to occurrences --
+it's a flat cross-project historical log by design, not an incident list.
 
 ## Events-as-overlay on Panel charts — proposed 2026-07-11, not started
 
