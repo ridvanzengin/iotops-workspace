@@ -7,6 +7,424 @@ them or start making blind decisions. Update this file as steps complete
 or decisions get made — it should always reflect current reality, not a
 frozen snapshot.
 
+## Query Rules: cross-table/cross-metric event detection via SQL, not Telegraf — proposed 2026-07-13, not started
+
+**Requirement (from the user):** a second, entirely separate kind of
+rule alongside today's Automater Rules. Today's Rule is real-time,
+per-metric, single-table only (deliberately — see the "no cross-table
+correlation" decision elsewhere in this file) — evaluated by
+`custom-telegraf`'s Go processor as each metric streams through.
+The new kind should:
+
+- Support conditions spanning multiple tables/metrics, not just one.
+- Support time-windowed aggregates, not just a point-in-time threshold
+  on the current value (e.g. "last 1h average", "last 6h average").
+- Support arbitrary AND/OR nesting across those aggregate conditions
+  (the user's example: last-1h avg CPU > 60% AND last-6h avg RAM < 2GB
+  OR current storage > 30GB).
+- Be authorable via a natural-language query builder, not just raw
+  hand-written conditions.
+- Explicitly **not** go through a Telegraf Automater at all.
+
+**Core design recommendation: this is a scheduled analytical query, not
+a streaming rule — model it as one, don't force it into the existing
+per-metric Go pipeline.** Concretely:
+
+1. **The condition is stored as SQL, not a structured expression tree.**
+   TimescaleDB already *is* the boolean/aggregate expression engine this
+   needs — time-windowed aggregates (`AVG(cpu_usage) FILTER (WHERE time
+   > now() - interval '1 hour')`), cross-table joins, arbitrary AND/OR
+   nesting are all native SQL with no precedence limitations (unlike
+   today's Rule/Condition model, which deliberately folds strictly
+   left-to-right with no parentheses — fine for one flat list of
+   same-table conditions, not expressive enough for genuinely nested
+   cross-table logic). Building a custom condition-tree DSL to replicate
+   what SQL already does would mean reinventing SQL, worse. The query's
+   result rows *are* the current match set — one row per matching
+   identifier (device/entity), e.g.:
+   ```sql
+   SELECT device_id FROM (
+     SELECT device_id,
+            AVG(cpu_usage) FILTER (WHERE time > now() - interval '1 hour') AS cpu_avg_1h,
+            AVG(ram_usage) FILTER (WHERE time > now() - interval '6 hours') AS ram_avg_6h,
+            MAX(storage_gb) AS storage_now
+     FROM device_metrics GROUP BY device_id
+   ) t
+   WHERE cpu_avg_1h > 60 AND ram_avg_6h < 2 OR storage_now > 30
+   ```
+2. **Reuse `validate_select_only_sql` (`app/shared/validators.py`)
+   as-is.** Already a *shared* guard, not something built freshly for
+   this — both `app/ai/service.py` (Ollama SQL generation) and
+   `app/telemetry/service.py` (Panel query execution) already call it.
+   Arguably more critical here than either existing call site: these
+   queries run unattended, on a schedule, with no human reviewing each
+   execution before it runs.
+3. **Natural-language authoring reuses `AiService` wholesale** — same
+   Ollama connection, same schema-aware prompt construction, same
+   guardrail, already built for the Dashboard AI SQL builder. This is
+   effectively the "Rule suggestions" tier from the AI Co-pilot design
+   note elsewhere in this file, given a concrete product surface — cross-
+   reference that entry rather than duplicating the NL-to-SQL work.
+4. **Evaluation via Celery Beat, not Telegraf/Go.** Celery already runs
+   in this stack (`celery-worker` service, Redis broker) — periodic
+   tasks are a small, natural extension, not new infrastructure (would
+   need a `celery-beat` process/service added). Each active Query Rule
+   evaluates on its own configurable interval (mirrors today's per-rule
+   `ttl` pattern) rather than a fixed platform-wide schedule, since "last
+   1h average" and "last 6h average" naturally want different check
+   frequencies than a sub-second streaming rule ever did.
+5. **The entire downstream Events pipeline is already reusable
+   unmodified.** `Occurrence` pairing, the Events sidebar, live SSE
+   delivery, Panel-chart overlays, manual-resolve (`resolve_mode`) — none
+   of it cares where an `Event` document came from, it already just
+   reads the `events` Mongo collection. Each evaluation cycle diffs the
+   query's current result set (keyed by whichever column plays the
+   `identifiers` role today) against the previous cycle's to decide
+   match vs. clear, then writes a `match`/`clear` `Event` exactly like
+   `log_rule_match` does today — reusing `to_document`/the existing
+   pairing logic verbatim.
+
+**Open design questions, not yet decided:**
+
+- **`Event.automater_id` is currently required**, assuming every event
+  came from an Automater (`app/event/models.py`). Needs to become
+  optional, or grow a proper `source_type` (`"automater"` |
+  `"query_rule"`) + generic `source_id`/`source_name` discriminator —
+  leaning toward the discriminator (cleaner long-term than two parallel
+  optional foreign keys), but this touches `Occurrence`,
+  `_occurrence_from`, and every frontend type that reads `automater_id`
+  today, so worth deciding deliberately rather than bolting on.
+- **Match-set identity**: the query's author (human or AI) must select
+  which output column is the "identifier" the match/clear diff keys off
+  — needs to be explicit in the stored `QueryRule`, not inferred.
+- **Runaway-query protection**: a statement timeout is not optional here
+  — an unbounded aggregate over a huge hypertable, re-run every 5
+  minutes forever, needs a hard timeout distinct from (probably shorter
+  than) whatever bound the interactive Panel-query path uses.
+- **Naming**: "Query Rule" used above as a working name, to avoid
+  colliding with the existing `Rule`/`Automater` vocabulary — not
+  settled.
+- Whether this needs its own `app/query_rule/` module mirroring
+  `app/automater/`'s structure (models/service/api/repository), or fits
+  better as an extension of `app/event/` — leaning toward a new module,
+  since its lifecycle (CRUD + Celery Beat scheduling) doesn't overlap
+  much with either existing one, but not decided.
+
+## Automater fan-out strategy per data-source kind — proposed 2026-07-13, not started
+
+**The gap this closes**: today, every Automater input is derived from a
+Collector's input by deploying a second, fully independent Telegraf
+instance that connects to the *same source* a second time (see
+`AutomaterService._find_input_for_table`/`create_rule`,
+`app/automater/service.py`). This is the right design for
+broker-mediated sources (mqtt/kafka/amqp) — the broker already fans one
+publish out to every independent subscriber, so two independent
+consumers "just work," and now do correctly (see the "Additional data
+source integrations" entry above for the consumer_group/queue-collision
+fix). It is **not** the right design for `http` — `http_listener_v2` has
+no broker, it's a plain point-to-point push target, so the Automater's
+"independent instance" is just a second, unreachable listener nothing
+ever pushes to. Confirmed live: `high-wind` never fired against the
+`data-sources-showcase`'s HTTP source until the showcase's own publisher
+was changed to push to both the Collector's and the Automater's
+containers explicitly — a workaround only possible because that
+publisher is code this repo owns; a real external webhook source has
+exactly one configurable target URL and no way to know a second listener
+exists.
+
+**Not a one-off HTTP quirk — every future data source will face the same
+fork, so it's worth deciding as a category, not per-plugin:**
+
+- **Broker-mediated sources (mqtt, kafka, amqp — keep independent
+  subscription, unchanged).** The broker's native fan-out is a *better*
+  mechanism than anything this repo could build on top: it preserves the
+  at-least-once delivery guarantee the tracking-metric fix (see "three
+  real bugs" in the data-sources entry) depends on, and an Automater
+  keeps evaluating rules even if the Collector's own container is briefly
+  down, since it's independently connected to the broker, not to the
+  Collector. Do not "generalize" push-forwarding onto these — it would
+  be a strict downgrade (weaker delivery guarantees, new Collector→
+  Automater coupling, an extra hop replacing a mechanism that already
+  works).
+- **Push-target / no-native-fan-out sources (http today; likely any
+  future webhook-style source) — need the Collector to forward.**
+  Telegraf already supports one input feeding multiple outputs within a
+  single process — so instead of the Automater trying to *listen* for a
+  push that will never come, the **Collector's own deployment should
+  gain an `[[outputs.http]]` block pointed at the Automater's container**
+  whenever an http-sourced Rule/Automater depends on that table,
+  forwarding a copy of what it already received and wrote to
+  TimescaleDB. Confirmed `outputs.http` exists in the Telegraf build
+  (`telegraf plugins outputs` lists it) — no Go work needed, same as the
+  original data-source integrations.
+- **Polled sources (not yet built: Modbus, OPC-UA) — very likely belong
+  in the forwarding category too, for a different reason.** These aren't
+  push-based, but they have no multi-consumer concept either — Telegraf
+  polls a PLC/device on an interval. A Collector and an Automater
+  independently polling the *same physical device* isn't just wasteful,
+  it can mean hitting real hardware's connection-slot or polling-rate
+  limits. When Modbus/OPC-UA land, this needs re-confirming against
+  their actual protocol semantics (not assumed from HTTP's reasoning
+  alone), but the working hypothesis is: anything without native
+  broker-style fan-out defaults to "Collector forwards," anything with
+  one stays independent.
+
+**Concrete implementation for the http case, not yet started:**
+
+1. New bookkeeping in `create_rule`/`delete_rule`
+   (`app/automater/service.py`): when an Automater's input derives from
+   an `http`-plugin_type Collector input, the Collector needs an
+   `[[outputs.http]]` added (removed on the Automater's/rule's deletion)
+   pointed at `http://iotops-automater-{automater_id}:{port}{path}`
+   (mirrors `_container_name` in `app/automater/docker.py`). Needs a new
+   `OutputPlugin` on the *Collector*'s own `outputs` list, keyed somehow
+   to "which Automater this forwards to" so it can be cleanly added/
+   removed as dependent Automaters come and go — not yet designed.
+2. Collector redeploy needs triggering whenever this forwarding output
+   changes, even though nothing about the Collector's own
+   inputs/timescaledb output changed — today `CollectorService` has no
+   notion of "redeploy because a dependent changed," only Automater does
+   (`_redeploy_or_stop`).
+3. Whether this should be visible in the Collector-editor UI at all (a
+   forwarding output the user didn't explicitly add) or stays a
+   backend-only implementation detail of how Automater rules against
+   http-sourced tables work — leaning toward the latter, needs a decision
+   before building the UI-facing parts either way.
+
+## Portfolio demo deployment — proposed 2026-07-13, not started
+
+**Requirement (from the user):** deploy a public demo soon, without
+waiting for the rest of the roadmap (data sources, AI Co-pilot) to land —
+this is a portfolio project and current state (v1 + most of Milestone 5)
+is already demo-worthy. Two decisions confirmed with the user:
+
+- **Hosting: a single small VM running the existing `docker-compose.yml`
+  as-is** (not a managed container platform) — closest to zero
+  re-architecting, matches local dev almost exactly.
+- **Interactivity: read-only showcase, not fully interactive.** The
+  backend spawns real Docker containers per Collector/Automater via the
+  Docker socket (`CollectorDockerManager`/`AutomaterDockerManager`,
+  `docker.from_env()`) — letting the public internet trigger that with no
+  auth/quotas/cleanup built for it is a real attack surface, so the
+  public demo shows the Beekeeping Showcase (and/or Rule Testing Sandbox)
+  running continuously server-side, but doesn't let anonymous visitors
+  create their own Collectors/Automaters.
+
+**What this needs, concretely — none of it started yet:**
+
+1. **Server-side read-only enforcement, not just hiding UI buttons.**
+   There is currently **no auth of any kind** in this backend (confirmed:
+   no auth middleware, no read-only-mode flag anywhere in
+   `app/config.py`/`app/main.py`) — every mutating endpoint
+   (`POST`/`PUT`/`DELETE` on `/api/collector`, `/api/automater`,
+   `/api/automater/rules`, deploy/stop actions, etc.) is wide open today.
+   A UI-only "hide the create button" would not actually stop a visitor
+   from hitting the API directly. Needs a real gate: simplest shape is a
+   `settings.demo_mode: bool` + a FastAPI dependency that 403s any
+   mutating request on Collector/Automater routers when set, wired in
+   only for the deployed instance's env, not touching local dev's
+   behavior at all.
+2. **Showcase data needs to look alive, not static.** The
+   `beekeeping-simulator` and `mqtt-publisher` compose services (already
+   exist, already used for local dev) need to keep running continuously
+   on the deployed VM so dashboards/events aren't just a frozen snapshot
+   — this is already how local dev behaves, just needs to survive a VM
+   reboot (compose `restart: unless-stopped`, already the pattern
+   `AutomaterDockerManager`'s own spawned containers use per
+   `DockerConfig.restart_policy`).
+3. **Reverse proxy + TLS** in front of `backend`(8000)/`frontend`(5173) —
+   nothing in this repo handles this today (`docker-compose.yml` exposes
+   raw ports directly, fine for local dev, not for a public host). Likely
+   a `caddy`/`nginx` service added to a separate
+   `docker-compose.prod.yml` (or an override file), not a change to the
+   dev compose file itself.
+4. **Not yet decided / needs the user's hands-on involvement** (VM
+   provisioning, DNS, and any cloud credentials aren't something an
+   agent session can do unilaterally from this environment): which VM
+   provider/plan, domain name (if any), and who holds the running
+   instance's ops burden (restarts, disk growth from Mongo/Timescale
+   data, image updates when `custom-telegraf`/backend/frontend change).
+
+## Additional data source integrations (Kafka, HTTP, AMQP) — DONE 2026-07-13
+
+Collectors can now ingest from **Kafka**, **HTTP** (webhook push, not
+poll), and **AMQP** (e.g. RabbitMQ), alongside the original MQTT — three
+new registry-level input plugins, zero Go changes, confirming the
+grounding check this entry started with: `custom-telegraf` already
+embeds the entire upstream Telegraf binary, so `kafka_consumer`,
+`http_listener_v2`, and `amqp_consumer` were already present in the
+image, just never registered on the IoTOps side.
+
+**What actually shipped:**
+
+- **Three new Pydantic config models**, mirroring `MqttConsumerConfig`'s
+  pattern field-for-field against each plugin's real Telegraf usage text
+  (`telegraf --usage <plugin>`, not guessed): `app/plugin/inputs/kafka.py`
+  (`KafkaConsumerConfig`), `http_listener.py` (`HttpListenerConfig`,
+  deliberately `http_listener_v2` — a push/webhook listener, matching
+  this platform's existing push-based ingestion shape, not `inputs.http`'s
+  poll-a-URL model), `amqp.py` (`AmqpConsumerConfig`). Each registered in
+  `app/plugin/registry.py`'s `build_default_registry()` as `kafka` ->
+  `kafka_consumer`, `http` -> `http_listener_v2`, `amqp` ->
+  `amqp_consumer` — confirmed `generate_toml`, `CollectorService`, and
+  `CollectorEditor.tsx`'s whole form (`PluginRows`/`PluginConfigForm`,
+  schema-driven from `Plugin.configuration_schema`) needed **zero
+  changes** to support them; the JSON-schema-driven form architecture was
+  already fully generic across input plugin_type.
+- **Automater's MQTT-only assumption generalized**, both sides:
+  - Backend (`app/automater/service.py`): `_find_mqtt_input`/
+    `_has_input_for_table` renamed and stripped of their
+    `plugin_type == "mqtt"` filter — any input plugin whose
+    `configuration.name_override` matches the rule's table now qualifies.
+  - Frontend (`AutomaterEditor.tsx`): the four `plugin_type === "mqtt"`
+    filters (table-name derivation, existing-input lookup, input-count
+    disambiguation) all dropped their MQTT-only filter. The one place
+    that genuinely needed new logic: deriving an input's default
+    measurement name when `name_override` is unset used to hardcode the
+    literal fallback `"mqtt_consumer"` — now fetches `/api/plugin` once
+    and looks up each input's real `telegraf_name` (`kafka_consumer`,
+    `http_listener_v2`, `amqp_consumer`, ...) instead of assuming MQTT.
+    Hardcoded "MQTT" UI copy reworded to be plugin-agnostic; the
+    Input-topics display line (MQTT/Kafka-specific field name) became a
+    best-effort `describeInputSource` helper checking `topics`/`paths`/
+    `queue` per plugin type rather than assuming `topics` exists.
+  - Dashboard needed no changes, confirmed — it only ever queries the
+    materialized TimescaleDB hypertable, with no awareness of which input
+    plugin produced the rows.
+- Config field naming deliberately mirrors `MqttConsumerConfig`'s
+  `tag_keys`/`json_string_fields`/`data_format` JSON-parser options on
+  all three new plugins (these are Telegraf's generic JSON-parser options,
+  not MQTT-specific — confirmed via `telegraf --usage`, which doesn't
+  even list them under `mqtt_consumer`'s own options either, since
+  they're inlined by the parser subsystem for any `data_format="json"`
+  plugin). This is what keeps the Dedup Identifiers pre-fill and
+  `missingTagKeys` warning in `AutomaterEditor.tsx` working unmodified
+  for every new source, with no plugin-specific frontend logic needed.
+
+Verified end-to-end against the real stack: rebuilt backend/frontend,
+confirmed all four input plugins appear in the Collector-creation
+dropdown with correct schema-driven fields/defaults (screenshotted
+kafka/http/amqp forms). Created a real HTTP-sourced Collector via the
+API, deployed it, pushed a JSON payload with `curl` from another
+container on the `iotops` network, confirmed it landed correctly in
+TimescaleDB (`http_sensor_data` table, `device_id` correctly promoted to
+a tag via `tag_keys`). Built an Automater rule against that same
+HTTP-sourced table — confirmed the generalized `_find_input_for_table`
+correctly derived an `http`-typed input (not just `mqtt`), deployed
+successfully, and a real HTTP push that matched the rule's condition
+flowed all the way through to a persisted, Active `Event`/`Occurrence` in
+the sidebar — the full Automation Engine loop working against a
+non-MQTT source for the first time. Full backend suite green throughout
+(268 tests, 8 new: 3 registry-level tests confirming each new plugin's
+real defaults/telegraf_name, 1 confirming all three share the JSON-parser
+field pattern, 1 new `AutomaterService` test creating a rule off a
+non-mqtt Collector input, plus the 4 fixed-up plugin-count assertions).
+Frontend `tsc --noEmit`/`oxlint` clean throughout.
+
+**Not done, deliberately out of scope for this pass**: Modbus and OPC-UA
+(industrial/SCADA protocols) — a genuinely different config shape
+(register-address/node-ID based, not topic+JSON), warranting their own
+follow-up rather than folding into this one.
+
+### Follow-up 2026-07-13: `examples/data-sources-showcase/` fixture, plus three real bugs it surfaced
+
+Built at the user's request, to have something hands-on to test the new
+plugins against personally (mirrors `beekeeping-simulator`'s
+self-provisioning pattern): a Project with a dedicated Kafka Collector
+(`kafka_metrics`, simulated factory-floor vibration sensors) and a
+second Collector combining `http` + `amqp` inputs in one Telegraf
+process (`http_metrics` simulated weather stations, `amqp_metrics`
+simulated delivery-fleet fuel levels), one Rule per source, and a
+3-panel Dashboard. Needed real new infrastructure this repo didn't have
+yet: `kafka` (`apache/kafka:3.7.0`, single-node KRaft, dual listener —
+`kafka:9092` for containers, `localhost:9094` for the user's own client
+tooling) and `rabbitmq` (`rabbitmq:3.13-management`, already cached
+locally) added to `docker-compose.yml`, both with no `profiles:` key so
+every profile includes them. The showcase itself is `--profile
+data-sources`, same off-by-default pattern as `beekeeping`.
+
+Building and verifying this against the real stack (not just unit tests)
+surfaced three real bugs, all now fixed — the third is the significant
+one, a pre-existing Automation Engine correctness gap that predates this
+milestone entirely, not something introduced by the new plugins:
+
+1. **Competing-consumer bug**: Kafka consumer groups and AMQP queues are
+   competing-consumer patterns — unlike MQTT's broadcast pub/sub, two
+   consumers sharing the same consumer_group/queue *split* messages
+   between them rather than each getting a full copy. `create_rule`'s
+   Automater-derives-input-from-Collector path was copying the
+   Collector's input configuration verbatim, including its
+   `consumer_group`/`queue` — so the Automater and Collector would have
+   silently split the stream ~50/50, each missing roughly half the data
+   (and half the rule matches), with no error anywhere. Fixed in
+   `AutomaterService._automater_scoped_configuration`
+   (`app/automater/service.py`): scopes `consumer_group`/`queue` to a
+   value distinct from the Collector's whenever present in the copied
+   configuration (a no-op for mqtt/http, which have neither field). 3
+   new Python tests.
+2. **HTTP push has no broker, unlike Kafka/AMQP/MQTT — a genuine
+   architectural gap, not fixed, just discovered and documented.**
+   Kafka/AMQP/MQTT all fan one publish out to every independent
+   consumer via a broker; `http_listener_v2` is a plain point-to-point
+   push target with nothing in between. The Collector's and Automater's
+   `http_listener_v2` instances are two unrelated listeners in two
+   separate containers, so a single push only ever reaches one of them.
+   Worked around *for this demo* by having `seed.py`'s
+   `_http_target_urls` resolve every Automater currently covering the
+   HTTP table and having `http_publisher.py` push to all of them — but a
+   real external webhook source only ever pushes to one configured URL
+   and has no way to know it needs to hit N containers, so this doesn't
+   generalize. The real fix belongs in the Automater deploy path —
+   reusing the Collector's own listener process for push-based plugin
+   types instead of spinning up a second, separately-unreachable one —
+   not attempted here; left as a known gap specific to HTTP (push-based)
+   sources. See `examples/data-sources-showcase/README.md`'s own note.
+3. **`processors/rule` was leaking tracking-metric references for every
+   metric it evaluated — a real, pre-existing correctness bug in
+   `custom-telegraf`, invisible until this session because nothing had
+   run an Automater against a tracking-metric input long enough (or
+   against one with a low enough flow-control ceiling) to notice.**
+   `docs/METRICS.md`: mqtt/kafka/amqp inputs use *tracking metrics* — the
+   broker delivery isn't acknowledged until Telegraf confirms the metric
+   reached (or was intentionally dropped by) every output. `rule.go`'s
+   `Apply()` only ever returns tagged `Copy()`s of a metric for rules
+   that match/clear — the original input metric `m` itself is *never*
+   included in the returned slice, matches or not. Telegraf's framework
+   has no generic "diff the input and output batches" fallback for a
+   custom processor; a plugin has to explicitly call `Drop()`/`Accept()`/
+   `Reject()` on every metric it doesn't pass through unchanged, and
+   `rule.go` never did — so `m`'s own tracking reference leaked, forever,
+   on *every single Apply() call regardless of whether a rule matched*.
+   Root-caused by reading `github.com/influxdata/telegraf/metric`'s
+   actual `Copy()`/tracking source (`go env GOMODCACHE` had it cached
+   locally) after live diagnosis on RabbitMQ (`rabbitmqctl list_queues`/
+   `list_consumers`) showed the Automater's AMQP queue pinned at exactly
+   `prefetch_count` (50) unacknowledged messages while `messages_ready`
+   grew unbounded — flow control blocking all further delivery once the
+   leaked-reference backlog hit that ceiling. Fixed: `Apply()` now calls
+   `m.Drop()` unconditionally for every input metric, once, after that
+   metric's rules have all been evaluated. 2 new Go tests using
+   `metric.WithTracking` to assert delivery actually completes (both
+   fail without the fix, confirmed by reverting it and re-running them).
+   **Why this was invisible before**: MQTT's default QoS 0 doesn't
+   require broker acks at all, so a leaked tracking reference has no
+   observable effect; Kafka's `max_undelivered_messages` defaults to
+   1000, so it takes a long time (hundreds of messages) to manifest;
+   AMQP's default `prefetch_count` of 50 hits the wall almost
+   immediately — this showcase is the first Automater ever run against
+   AMQP, which is exactly what made the bug fall out. Rebuilt
+   `custom-telegraf:latest` and redeployed both showcase Automaters to
+   pick up the fix; confirmed the previously-stuck AMQP queue drained to
+   `0 ready / 0 unacknowledged` and `low-fuel` fired a real match/clear
+   cycle within seconds of redeploying.
+
+Verified end-to-end against the real stack: all three tables
+(`kafka_metrics`/`http_metrics`/`amqp_metrics`) populating with correct
+tags/fields, all three Rules firing genuine match/clear cycles, the
+3-panel Dashboard rendering all three live in the browser. Full backend
+suite green throughout (IoTOps: 271 tests, 3 new; custom-telegraf: full
+suite green, 2 new).
+
 ## Event resolution mode: auto-clear vs manual-resolve — DONE 2026-07-13
 
 Every Rule now has a `resolve_mode` (`auto`, default, or `manual`),
@@ -569,9 +987,42 @@ superseded ones if the "why not just X" is ever worth re-deriving.
 ## AI Co-pilot — design notes for later, proposed 2026-07-13, not started
 
 Not scoped or started yet — the Co-pilot icon/panel in the activity bar
-is still a placeholder (see "Events sidebar polish" above). Capturing
-one concrete constraint now, while it's fresh, so a future session
-building the co-pilot's rule/dashboard *suggestion* logic doesn't
+is still a placeholder (`EventsContext.tsx`'s `ActivePanel` already has a
+`{ kind: "copilot" }` case and `openCopilotPanel()`, but no content
+component exists yet). Two things captured here: a proposed scope
+(strawman, not confirmed with the user yet) and one concrete constraint
+already known to matter once suggestion logic exists.
+
+**Proposed scope — a persistent assistant panel, not just SQL
+generation.** The activity bar already reserves Co-pilot its own
+always-reachable panel slot (same level as a Project's events panel),
+distinct from the existing per-panel "AI SQL builder" pulled into v1
+(Milestone 3 follow-up, `app/ai/service.py`'s `AiService.generate_sql`
+via Ollama) — that placement implies something broader than one more SQL
+box. Candidate scope, roughly in build order (each layers on the
+Events/Rule/Dashboard models that already exist, not new subsystems):
+
+1. **Q&A over what's already stored** — chat against the structured
+   `Event`/`Occurrence` history and current telemetry schema ("why did
+   hive-3 alert three times today?", "what's `env-02`'s temperature
+   trend this week?"), reusing `AiService`'s existing Ollama connection
+   and the same read-only-SQL-generation guardrail
+   (`InvalidQueryError`/`QueryExecutionError`) already enforced for the
+   SQL builder — this is the lowest-risk slice since it's pure reads.
+2. **Rule suggestions** — proposing a new Rule from an observed pattern
+   in telemetry (e.g. a column that's crossed a threshold repeatedly),
+   pre-filled into the existing `AutomaterEditor.tsx` form rather than a
+   silent auto-create, so a human still reviews/submits it.
+3. **Dashboard/panel suggestions** — same idea, proposing a chart from a
+   schema + usage pattern, landing in `PanelBuilder.tsx`.
+
+Rule and Dashboard suggestions are explicitly staged after Q&A, not
+first — they're where the identifier/value_column naming constraint
+below actually bites, so worth having the simpler read-only slice
+shipped and validated first.
+
+Capturing one concrete constraint now, while it's fresh, so a future
+session building the co-pilot's rule/dashboard *suggestion* logic doesn't
 rediscover it the hard way:
 
 - **Rule `identifiers` and Dashboard `Variable.value_column`s have no
