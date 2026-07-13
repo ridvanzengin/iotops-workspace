@@ -110,7 +110,7 @@ per-metric Go pipeline.** Concretely:
   since its lifecycle (CRUD + Celery Beat scheduling) doesn't overlap
   much with either existing one, but not decided.
 
-## Automater fan-out strategy per data-source kind — proposed 2026-07-13, not started
+## Automater fan-out strategy per data-source kind — http case DONE 2026-07-13
 
 **The gap this closes**: today, every Automater input is derived from a
 Collector's input by deploying a second, fully independent Telegraf
@@ -169,27 +169,98 @@ fork, so it's worth deciding as a category, not per-plugin:**
   broker-style fan-out defaults to "Collector forwards," anything with
   one stays independent.
 
-**Concrete implementation for the http case, not yet started:**
+**Concrete implementation for the http case — shipped 2026-07-13, on
+`feature/automater-http-fanout`.** The three open questions above got
+settled and built as designed:
 
-1. New bookkeeping in `create_rule`/`delete_rule`
-   (`app/automater/service.py`): when an Automater's input derives from
-   an `http`-plugin_type Collector input, the Collector needs an
-   `[[outputs.http]]` added (removed on the Automater's/rule's deletion)
-   pointed at `http://iotops-automater-{automater_id}:{port}{path}`
-   (mirrors `_container_name` in `app/automater/docker.py`). Needs a new
-   `OutputPlugin` on the *Collector*'s own `outputs` list, keyed somehow
-   to "which Automater this forwards to" so it can be cleanly added/
-   removed as dependent Automaters come and go — not yet designed.
-2. Collector redeploy needs triggering whenever this forwarding output
-   changes, even though nothing about the Collector's own
-   inputs/timescaledb output changed — today `CollectorService` has no
-   notion of "redeploy because a dependent changed," only Automater does
-   (`_redeploy_or_stop`).
-3. Whether this should be visible in the Collector-editor UI at all (a
-   forwarding output the user didn't explicitly add) or stays a
-   backend-only implementation detail of how Automater rules against
-   http-sourced tables work — leaning toward the latter, needs a decision
-   before building the UI-facing parts either way.
+- **Keying/bookkeeping**: `OutputPlugin` (`app/shared/models.py`) gained
+  `automater_id: UUID | None`, set only on a Collector's forwarding
+  output. Not stored in `configuration` — that dict gets silently
+  stripped back to each plugin's declared schema on every
+  `validate_configuration` round-trip (Pydantic v2's default
+  `extra="ignore"`), so a same-shaped `automater_id` embedded there
+  wouldn't have survived a single redeploy.
+- **Collector redeploy trigger**: new `CollectorService.redeploy_if_running`
+  — persists without touching Docker if the Collector isn't currently
+  deployed, otherwise regenerates TOML and redeploys. `AutomaterService`
+  now depends on `CollectorService` (not a bare `CollectorRepository`) so
+  it can call this as a side effect of `create_rule`/`delete`.
+- **UI visibility**: stayed backend-only, per the original leaning — no
+  Collector-editor changes.
+- New `HttpOutputConfig`/`http_forward` plugin (`app/plugin/outputs/http.py`,
+  registered in `registry.py`, `telegraf_name="http"` — same real
+  `[[outputs.http]]` section as the product-facing `http` *input*'s
+  different registry name). `AutomaterService.create_rule` adds one to the
+  Collector's `outputs` (keyed on `(automater_id, url)`, not just
+  `automater_id` — a multi-table Automater deriving two http tables off
+  the same Collector needs two forwards, one per port, not the second
+  silently skipped) whenever the matched input's `plugin_type == "http"`;
+  `AutomaterService.delete` scans every Collector and strips any it finds
+  for that `automater_id`, so deleting an Automater doesn't leave a
+  permanent `outputs.http` block retrying against a removed container.
+
+**Three more real, previously-latent bugs found via live verification against
+the `data-sources-showcase` stack — same pattern as the original data-source
+integrations work, not unit-test-only this time either:**
+
+1. **Idle keep-alive race, 100% reproducible, not occasional.** Go's
+   `net/http.Server` falls back to `ReadTimeout` as its *idle* keep-alive
+   timeout whenever `IdleTimeout` isn't set separately, and
+   `http_listener_v2` exposes no separate idle-timeout option (confirmed
+   via `telegraf --usage http_listener_v2`) — its stock 10s
+   `read_timeout`/`write_timeout` default exactly matches this platform's
+   fixed 10s `flush_interval`, so the Collector's client and the
+   Automater's server raced to reuse/close the same pooled connection on
+   every single flush (`EOF` / `connection reset by peer` / `server closed
+   idle connection`, rotating between all three). Fixed: an Automater's
+   copied `HttpListenerConfig` now gets `read_timeout`/`write_timeout`
+   bumped to `60s` in `_automater_scoped_configuration` — comfortably clear
+   of the flush cadence.
+2. **JSON format mismatch — silent, no error anywhere, would have shipped
+   broken.** Telegraf's *output* JSON serializer and *input* JSON parser
+   are different, non-interoperable shapes (the output wraps metrics in
+   telegraf's own `{"metrics": [{"fields": ..., "tags": ...}]}` envelope;
+   the input parser expects a flat object of field/tag values, the shape a
+   real webhook sends). A `data_format="json"` forwarding output made the
+   Automater's listener receive well-formed-but-empty metrics — no parse
+   error, no transport error, the expected fields/tags just never
+   appeared, so no rule could ever match. Fixed: forwarding uses
+   `data_format="influx"` (line protocol) on both sides — the one format a
+   Telegraf output and input share losslessly — safe because this
+   listener's only sender is the forwarding output by design (a real
+   external webhook always targets the Collector's own URL).
+3. **Switching parsers without dropping the old parser's fields
+   crash-loops the container — a genuine, general `HttpListenerConfig` gap,
+   not specific to forwarding.** `tag_keys`/`json_string_fields`/etc. are
+   `parsers.json`-only options; Telegraf's strict config validation
+   crash-loop-fails ("configuration specified the fields [...], but they
+   were not used") if any remain set once `data_format` selects a
+   different parser — would have hit *any* http Collector input a user
+   configured directly with `data_format="influx"`, forwarding or not.
+   Fixed at the model level (`HttpListenerConfig.model_dump` override,
+   `app/plugin/inputs/http_listener.py`), not just in the Automater's
+   scoping step, so every future caller is protected, not only this one.
+
+Verified end-to-end against the real running stack, not just the 8 new unit
+tests (280 total, full suite green): created a fresh http-sourced rule/
+Automater off the `data-sources-showcase`'s real `http_metrics` Collector,
+confirmed the generated `telegraf.conf` on the actual deployed Collector
+container contained the correct `[[outputs.http]]` block, sent a single
+`curl` push to **only** the Collector's URL (not today's still-in-place
+multi-target workaround), and watched it flow through the forward, get
+evaluated by the Automater's real rule processor, and land as a genuine
+`active` `Occurrence` with correct tags/fields via the real Events API —
+closing the exact gap this entry started from. Deleting the Automater
+correctly removed the forwarding output and left the Collector's config
+back to just its own `timescaledb` output. Cleaned up the verification
+Automater afterward; the showcase's own `_http_target_urls` multi-target
+workaround was deliberately left in place (still correct, not required to
+change for this fix, a reasonable follow-up not done here).
+
+**Not done here, still open**: Modbus/OPC-UA polled sources (not built
+yet) — the "polling-rate-limits" hypothesis above still needs
+re-confirming against their real protocol semantics when they land, not
+assumed from HTTP's reasoning alone.
 
 ## Portfolio demo deployment — proposed 2026-07-13, not started
 
