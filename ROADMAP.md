@@ -326,7 +326,7 @@ of the codebase). `Home.tsx`'s "Latest events" widget intentionally left
 on the raw `Event`/flag-colored styling, not switched to occurrences --
 it's a flat cross-project historical log by design, not an incident list.
 
-## Events-as-overlay on Panel charts — proposed 2026-07-11, not started
+## Events-as-overlay on Panel charts — DONE 2026-07-13
 
 **Sequencing: after the events sidebar is polished, not before.** Captured
 now so the design isn't lost, not because it's next up.
@@ -378,7 +378,161 @@ discussion, in order:
   same reasoning as chart type or time range defaults already being part
   of what a saved dashboard shows, not something every viewer reconfigures.
 
-**Not started.**
+**Implemented, on `feature/panel-event-overlay`.** Shipped mostly as
+designed above, with a few things settled/changed during implementation
+and two follow-up rounds of polish:
+
+- **`Panel.event_rule_ids: list[UUID]`**, persisted as designed (the
+  "recommendation" above, confirmed). `PanelQueryResult` (new, extends
+  `TelemetrySqlQueryResult`) also returns the query's resolved
+  `time_from`/`time_to`, so the events fetch reuses the exact window the
+  panel's own telemetry query just resolved rather than a separately
+  (and therefore slightly later) resolved "now". `GET /api/event` gained
+  `since`/`until`/`rule_id` (repeated) query params.
+- **Control ended up on the actual dashboard panel's header** (next to
+  the "..." edit/delete menu), not in the panel editor form as the
+  original draft above assumed — moved there deliberately after initial
+  implementation, specifically so it's editable inline without opening
+  the full panel editor, and visible only when the project has ≥1 rule.
+  `PanelBuilder`'s form still round-trips `event_rule_ids` headlessly
+  (loads it, resends it unchanged) since its save is a full `PanelInput`
+  replace — no UI control there anymore, but the field would otherwise
+  silently get wiped by any unrelated edit made through that page.
+- **Rendered as scatter dots, not markLines** — the original "vertical
+  line per event" idea (never written down here, decided mid-build) was
+  replaced after user feedback: shaped by Rule (triangle/square/diamond/
+  circle, cycled past 4 rules) so multiple overlaid rules stay visually
+  distinguishable independent of color; colored red/green for active/
+  resolved. Positioned on a **dedicated hidden secondary y-axis fixed to
+  [0, 1]**, every marker plotted at y=1 — a deliberate choice over
+  computing "above the current data max" (would need recomputing on
+  every data refresh and could still collide with a right-side axis);
+  the fixed-lane approach keeps markers in one consistent band
+  regardless of what the real data is doing, closer to how Grafana
+  positions its own annotations.
+- **Overlay events are filtered by the panel's currently resolved
+  dashboard variable values** (added after initial ship, per user
+  feedback) — an event only counts if, for every dashboard variable with
+  a resolved value, the event's own tags either agree with it or don't
+  mention that column at all (a Rule's identifiers don't have to cover
+  every dashboard variable). Matched by exact column-name equality
+  between `Variable.value_column` and the event's tag keys — see the AI
+  Co-pilot design notes below for why this is a real, unenforced
+  assumption, not a guarantee.
+- **Occurrence card identifiers are clickable**, setting the matching
+  dashboard variable when one's open (added as a related follow-up,
+  same session) — see "Occurrence card identifiers set dashboard
+  variables" below for the full design and its safeguards.
+
+12 new/adjusted backend tests (`Panel.event_rule_ids` round-trip,
+`PanelQueryResult` bounds, `GET /api/event`'s new filters incl. a
+regression test for the Mongo string-vs-BSON-date subtlety `since`/
+`until` hit), full suite (252) passing throughout. Verified live against
+real multi-hive data at every stage, including a caught-before-ship bug
+(the overlay fetch's client-side `limit` exceeded the endpoint's own
+`le=200` cap — would have silently 422'd and shown no events, swallowed
+by a `.catch()`).
+
+## Occurrence card identifiers set dashboard variables — DONE 2026-07-13
+
+Follow-up to the Panel-overlay work above, same session: an occurrence
+card's identifier chips (e.g. `hive_id: hive-3`) are clickable, setting
+the matching dashboard variable(s). Went through three iterations the
+same day as the user pushed back twice on unnecessary complexity —
+this section describes the final design; see git history for the two
+superseded ones if the "why not just X" is ever worth re-deriving.
+
+- **Matching is name-based and best-effort**, same assumption the
+  overlay-filtering feature above already relies on: an identifier key
+  only lines up with a dashboard variable if that variable's
+  `value_column` happens to be spelled identically. There's no enforced
+  relationship between a Rule's `identifiers` and a Dashboard variable's
+  `value_column` in the data model — they're authored independently, by
+  different flows, sometimes against different tables. See the AI
+  Co-pilot design notes immediately below for why this matters beyond
+  just this one feature.
+- **A click applies the occurrence's *whole* identifiers dict, not just
+  the one chip clicked** — settled after the user pointed out that
+  identifiers are naturally a set (e.g. `apiary_id` + `hive_id`
+  together), and applying them one at a time was exactly what made a
+  same-apiary-mismatched click look like it "didn't work": clicking
+  `hive_id: hive-4` in isolation correctly fails if the dashboard's Hive
+  variable is apiary-scoped and Apiary hasn't been updated to `apiary-2`
+  yet — but clicking *either* chip on that occurrence now applies both
+  `apiary_id` and `hive_id` together, in dependency order, so Hive's
+  options get re-resolved against the *new* Apiary before Hive itself is
+  checked against them. `DashboardEditor.selectIdentifiers` does this:
+  finds every dashboard variable whose `value_column` is present in the
+  identifiers dict, then calls the existing `resolveVariablesFrom` once
+  starting from the *earliest* matched variable's index (not per
+  identifier) — a small but important reuse of the already-existing
+  cascading-variable-resolution logic manual dropdown changes use, not
+  new machinery.
+- **No client-side "is this value currently valid" pre-check exists
+  anymore, and doesn't need to** — dropped once identifiers started
+  being applied together: `resolveVariablesFrom` already falls back
+  gracefully to the first available option if a requested value still
+  doesn't resolve after the cascade (the same behavior a manual dropdown
+  pick that's no longer valid already gets), so there was never a real
+  need for a separate upfront check duplicating that same safety net.
+- **If no dashboard is open (or a different project's is), the
+  occurrence's own `project_id` opens that project's default dashboard
+  (or its first one, if no default is set) and applies the selection
+  once it loads** — `EventsContext.openDashboardAndSelectIdentifiers`
+  stashes a pending `{dashboardId, identifiers}` in a ref and navigates;
+  `registerDashboardVariables` (called by the destination dashboard once
+  it mounts and resolves its own variables) checks for a pending
+  selection matching its own id and applies it immediately. The only
+  remaining inline-error case is "this project has no dashboard to open
+  at all" — everything else (no column match, value doesn't resolve)
+  degrades silently now, same reasoning as the point above.
+- Verified live: clicking an `apiary_id`+`hive_id` pair belonging to a
+  *different* apiary than the one currently selected correctly updates
+  both variables together (previously failed when applied one at a
+  time); clicking an identifier from a completely different page (no
+  dashboard open at all) correctly navigates to the project's dashboard
+  and lands with both variables already set, no error shown.
+
+## AI Co-pilot — design notes for later, proposed 2026-07-13, not started
+
+Not scoped or started yet — the Co-pilot icon/panel in the activity bar
+is still a placeholder (see "Events sidebar polish" above). Capturing
+one concrete constraint now, while it's fresh, so a future session
+building the co-pilot's rule/dashboard *suggestion* logic doesn't
+rediscover it the hard way:
+
+- **Rule `identifiers` and Dashboard `Variable.value_column`s have no
+  enforced relationship, but two shipped features quietly depend on them
+  matching by name anyway**: overlay-events time-window filtering (see
+  "Events-as-overlay on Panel charts" above) and clicking an occurrence
+  card's identifier to set a dashboard variable (see directly above).
+  Both work by exact string equality between an identifier's key and a
+  variable's `value_column` — e.g. a Rule identified by `hive_id` only
+  lines up with a Dashboard variable whose `value_column` is also
+  literally `hive_id`. Today this holds in the beekeeping showcase data
+  purely because the schema is used consistently by hand, not because
+  anything enforces it.
+- **When the co-pilot suggests a new Rule or a new Dashboard (Variable),
+  it should deliberately keep identifier keys and variable value_columns
+  spelled identically for the same underlying column**, wherever both a
+  Rule and a Dashboard Variable plausibly reference the same table/
+  concept — e.g. if it suggests a Rule with `identifiers = ["hive_id"]`
+  on `hive_metrics`, and separately suggests (or the user already has) a
+  Dashboard variable sourced from `hive_metrics.hive_id`, that variable's
+  `value_column` should be `hive_id`, not a synonym like `hive` or
+  `device_id`. This isn't a new capability the co-pilot needs to build —
+  it already has to pick real column names from the schema either way —
+  just a constraint to keep in mind so suggested rules and suggested
+  dashboards stay usable together with the two features above, rather
+  than silently degrading to "never matches" because of a naming choice
+  nothing forced it to make consistently.
+- **Not a blocking decision, no schema change implied.** No explicit
+  "this variable corresponds to this identifier" binding is being added
+  to either model — matching stays purely name-based, with the two
+  features above already degrading safely (non-clickable chip, no
+  filter applied) when names don't align. This note exists so the
+  co-pilot's *suggestions* default to alignment, not so the *product*
+  enforces it.
 
 ## Events sidebar + persisted event store — DONE 2026-07-10
 
