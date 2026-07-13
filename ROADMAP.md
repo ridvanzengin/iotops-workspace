@@ -7,6 +7,79 @@ them or start making blind decisions. Update this file as steps complete
 or decisions get made — it should always reflect current reality, not a
 frozen snapshot.
 
+## Event resolution mode: auto-clear vs manual-resolve — DONE 2026-07-13
+
+Every Rule now has a `resolve_mode` (`auto`, default, or `manual`),
+settable from a "Resolution" dropdown on the rule-creation form
+(`AutomaterEditor.tsx`) next to Dedup TTL. Auto-clear behaves exactly as
+before. A manual-resolve Rule never auto-emits a `clear` — its occurrence
+stays `ACTIVE` until a human resolves it from a new "Resolve" button on
+`OccurrenceCard.tsx` (left of "Show detail," same row), which opens a
+small inline notes input; the note is only surfaced in the JSON detail
+dump once "Show detail" is expanded, never on the collapsed card.
+
+**Settled design, resolving the two open questions this entry originally
+posed:**
+
+- **The opt-out flag lives cross-repo, Go included** (the first candidate
+  design, not the Go-untouched alternative): `Rule.resolve_mode`
+  (`app/automater/models.py`) flows through `DeployedRule`/
+  `RuleProcessorConfig` into the generated TOML exactly like
+  `identifiers`/`ttl`, into a new `RuleConfig.ResolveMode` field
+  (`toml:"resolve_mode"`) in `custom-telegraf/plugins/processors/rule/rule.go`.
+  `evaluate()` skips `clearFiring()` entirely for a manual-resolve rule —
+  the Redis firing key is never deleted or cleared on its own, only ever
+  refreshed by repeat-match heartbeats, exactly the same dedup semantics
+  auto-clear rules already had while still "firing." This was the
+  correctness-preserving option: the Go-untouched alternative would have
+  let the real firing key keep getting deleted by Go on every condition-
+  clear regardless, silently producing duplicate `ACTIVE` occurrences on
+  any flapping condition.
+  `annotate()` also stamps a `resolve_mode` tag (defaulting empty to
+  `"auto"`) on every matched metric so `Occurrence`/`Event` know which
+  mode produced them.
+- **Manual resolution is itself an `Event`**: resolving calls
+  `EventRepository.resolve_occurrence(match_event_id, notes)`, which
+  writes a synthetic `clear` `Event` (copying the original match's
+  `tags`/`identifier_keys` so it groups correctly under the existing
+  `_pair_occurrences`, no pairing-logic changes needed) carrying the new
+  `Event.resolution_notes` field, then **deletes the underlying Redis
+  firing key** (confirmed with the user: resolving re-arms the rule
+  immediately, same as an auto-clear would — if the condition is still
+  true, the next matching metric fires a brand-new occurrence right
+  away, not a suppressed repeat), and publishes over the same
+  `events:{project_id}` SSE channel `tasks.py`'s `log_rule_match` already
+  uses — the existing `reconcileOccurrence` on the frontend picks it up
+  live with zero new pairing code. `Occurrence` gained a stable `id`
+  (the underlying match `Event`'s own id) purely so a "Resolve" API call
+  has something to address, since an Occurrence is otherwise just a live
+  pairing with no document of its own.
+- The Redis firing-key deletion needed a new DB-0-scoped client
+  (`settings.automater_firing_redis_uri`, `get_firing_redis_client()`) —
+  distinct from the existing DB-1 client used for the Celery broker and
+  SSE pub/sub — and a Python reimplementation of `rule.go`'s `firingKey()`
+  hashing (SHA-256 of `"|"`-joined identifier values, hex-encoded) using
+  the *match event's own captured* `rule_name`/`identifier_keys`/`tags`/
+  `fields`, not the Rule's current live state, since a rename after the
+  fact would otherwise reconstruct the wrong key. A non-string identifier
+  value formatting differently between Go's `%v` and Python's `str()` is
+  an accepted, safe degradation (the stale key just survives until its
+  TTL expires) — not something this implementation tries to solve
+  perfectly.
+
+Verified end-to-end against the real stack (not just unit-level): rebuilt
+`custom-telegraf:latest`, created a manual-resolve rule against
+`examples/rule-testing-publisher`'s `env_readings` fixture via the real
+UI, confirmed a tripped condition stays `ACTIVE` through real oscillating
+telemetry that would have auto-cleared an ordinary rule, resolved it from
+the sidebar with a note (flipped to Resolved live via SSE, note hidden
+until expanded), and re-tripped the same sensor to confirm a fresh
+`ACTIVE` occurrence fired immediately (dedup key correctly cleared).
+12 new tests added across both repos (4 Go, in `rule_redis_test.go`; 8
+Python, split across `test_repository.py`/`test_api.py`), full existing
+suites still green (custom-telegraf's `go test ./...`, IoTOps's
+260-test `pytest` suite).
+
 ## Events sidebar polish (activity bar, live delivery, card redesign) — DONE 2026-07-11
 
 **Sequencing: before the Panel-overlay feature below, after the initial
