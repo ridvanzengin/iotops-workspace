@@ -7,6 +7,79 @@ them or start making blind decisions. Update this file as steps complete
 or decisions get made — it should always reflect current reality, not a
 frozen snapshot.
 
+## Events sidebar: badge/count consistency, time range, search, pagination — DONE 2026-07-14
+
+**Problem (user-reported):** the ActivityBar's per-project badge, EventsPanel's
+per-rule filter chips, and the actual rendered occurrence cards showed three
+different numbers that could never agree, plus "we can't reasonably fetch 826
+events but need consistency." Root cause: three unrelated counting semantics —
+`unresolved_counts_by_project` (true unresolved count, full-collection scan,
+all projects at once), `counts_by_rule` (lifetime *match-document* count via a
+real Mongo aggregation), and `list_occurrences` (a hard-capped 50/200-item
+window mixing active+resolved, sorted by recency) — layered on top of a panel
+that filtered client-side against whichever generic, differently-scoped fetch
+happened to already be loaded. `list_occurrences` already accepted a `rule_ids`
+filter server-side, but nothing on the API or frontend ever passed it — the
+capability existed and was simply unreachable.
+
+**Fix — one shared query, not three:**
+- `EventRepository._query_occurrences(project_id, since, rule_ids, status,
+  search)` is now the single source of truth `list_occurrences` (returns a
+  sliced page + `total`) and the new `occurrence_counts_by_rule` (paired-
+  Occurrence counts, not raw match documents — these differ whenever a repeat
+  match while one's already open gets defensively dropped by
+  `_pair_occurrences`) both build on. A rule chip's count and what clicking it
+  loads can no longer structurally diverge — same computation, not two.
+- **Time-windowed by default (last 1h, same relative-code convention as the
+  Dashboard's own time-range `<select>`, resolved server-side via
+  `resolve_time_range`)** — a `since` bound directly on the Mongo query keeps
+  every fetch cheap regardless of a project's total history size, which is
+  what actually makes real pagination viable (no full-collection scan per
+  request anymore). EventsPanel gained a range selector + a search box (also
+  server-side, checked against `rule_name`/`message`/`category`/`event_type`
+  **and identifier keys/values** — the latter added after discovering search
+  silently failed for any project whose rules have generic/placeholder naming,
+  e.g. Beekeeping Showcase's leftover test rules ("sdf", "hum") where the only
+  actually-distinguishing content is the identifier chips like `hive_id:
+  hive-5`) above the filter chips.
+- **Real pagination**: 20 cards/page, `Prev`/`Next` + "X–Y of Z", `total`
+  always reflects the full filtered count even though only one page is ever
+  fetched.
+- **ActivityBar's own badge deliberately stays non-windowed** ("currently
+  unresolved regardless of age," not "unresolved in the last 1h") — a
+  still-broken issue from outside the panel's default window shouldn't
+  silently vanish from the at-a-glance indicator. The panel's own "Active"
+  filter chip, by contrast, needed a *window-scoped* count (a `limit=0`
+  companion request reusing the exact same status=active query) to stay
+  consistent with what clicking it loads.
+- **Live updates simplified**: replaced the previous incremental client-side
+  reconciliation (`reconcileOccurrence`, manual +1/-1 array patching,
+  deleted — see `frontend/src/utils/occurrences.ts`'s removal) with a
+  debounced refetch of the current page + counts on any relevant SSE event.
+  Only viable because the windowed queries are now cheap enough to just redo;
+  trades a small amount of request volume for eliminating a whole class of
+  client/server state-drift bugs.
+- **Cards are now colored by rule** (`hashColor(rule_id)`, shared with
+  EventsPanel's rule chips and ActivityBar's project badges) **instead of
+  severity** — supersedes this file's "Event card redesign" section below
+  ("Color the card by severity, not match/clear"), which is now stale.
+  Severity moved to a small dot in the card header, then removed entirely
+  (it didn't visually reconcile with the badge/chip colors and the border
+  already carried rule identity — severity is still visible in the card's
+  expand-detail drawer). The shared hash-color palette itself was also
+  replaced: the old 8-color set failed the dataviz skill's chroma-floor
+  check on one slot and, separately, had a color that was an exact duplicate
+  of the app's own `--accent` purple; swapped for the skill's validated
+  reference categorical palette (`node scripts/validate_palette.js` — all
+  checks pass on this app's light surface).
+- **Bug caught along the way, not by design**: `query_rule/service.py`'s
+  scheduled-evaluation loop also called `list_occurrences` and broke
+  silently (wrong tuple unpacking) once its return shape changed to
+  `(items, total)` — only surfaced by running the *full* backend suite, not
+  just `tests/backend/event/`. Any future change to a shared repository
+  method's signature/return shape needs a repo-wide grep for callers first,
+  not just the obviously-related test file.
+
 ## Query Rules: cross-table/cross-metric event detection via SQL, not Telegraf — DONE 2026-07-14
 
 **Requirement (from the user):** a second, entirely separate kind of
