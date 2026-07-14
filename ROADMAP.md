@@ -7,7 +7,7 @@ them or start making blind decisions. Update this file as steps complete
 or decisions get made — it should always reflect current reality, not a
 frozen snapshot.
 
-## Query Rules: cross-table/cross-metric event detection via SQL, not Telegraf — proposed 2026-07-13, not started
+## Query Rules: cross-table/cross-metric event detection via SQL, not Telegraf — DONE 2026-07-14
 
 **Requirement (from the user):** a second, entirely separate kind of
 rule alongside today's Automater Rules. Today's Rule is real-time,
@@ -84,31 +84,99 @@ per-metric Go pipeline.** Concretely:
    `log_rule_match` does today — reusing `to_document`/the existing
    pairing logic verbatim.
 
-**Open design questions, not yet decided:**
+**Open design questions from the original proposal, all settled during
+implementation:**
 
-- **`Event.automater_id` is currently required**, assuming every event
-  came from an Automater (`app/event/models.py`). Needs to become
-  optional, or grow a proper `source_type` (`"automater"` |
-  `"query_rule"`) + generic `source_id`/`source_name` discriminator —
-  leaning toward the discriminator (cleaner long-term than two parallel
-  optional foreign keys), but this touches `Occurrence`,
-  `_occurrence_from`, and every frontend type that reads `automater_id`
-  today, so worth deciding deliberately rather than bolting on.
-- **Match-set identity**: the query's author (human or AI) must select
-  which output column is the "identifier" the match/clear diff keys off
-  — needs to be explicit in the stored `QueryRule`, not inferred.
-- **Runaway-query protection**: a statement timeout is not optional here
-  — an unbounded aggregate over a huge hypertable, re-run every 5
-  minutes forever, needs a hard timeout distinct from (probably shorter
-  than) whatever bound the interactive Panel-query path uses.
-- **Naming**: "Query Rule" used above as a working name, to avoid
-  colliding with the existing `Rule`/`Automater` vocabulary — not
-  settled.
-- Whether this needs its own `app/query_rule/` module mirroring
-  `app/automater/`'s structure (models/service/api/repository), or fits
-  better as an extension of `app/event/` — leaning toward a new module,
-  since its lifecycle (CRUD + Celery Beat scheduling) doesn't overlap
-  much with either existing one, but not decided.
+- **Naming**: settled as `QueryRule` in code (backend module, Go/real-time
+  `Rule` left completely untouched — renaming it would've been pure
+  cross-repo churn for no functional gain). UI labels the two kinds
+  "Real-time" and "Scheduled" purely as copy, not identifiers.
+- **`Event.automater_id`/`Occurrence.automater_id`**: made `UUID | None`,
+  paired with a new `source_type: Literal["automater", "query_rule"]`
+  discriminator (default `"automater"`, fully backward-compatible with
+  every existing document) and a new `query_rule_id: UUID | None`. Went
+  with the discriminator over two parallel optional foreign keys, per the
+  original leaning. `EventRepository._pair_occurrences` needed **zero**
+  changes — confirmed it keys purely on `rule_id` + identifier tag values,
+  never `automater_id`, so a `QueryRule` just uses its own `id` as
+  `rule_id`.
+- **Match-set identity**: `QueryRule.identifiers: list[str]` — same shape
+  and same "Identifiers" label as `Rule.identifiers`, explicit in the
+  stored model as designed, not inferred.
+- **Runaway-query protection**: a hard-coded 10s `asyncpg` native timeout
+  on every scheduled execution (`TelemetryRepository.execute_match_query`)
+  — shorter than the interactive Panel path, which turned out to have
+  **no timeout at all** (a pre-existing gap, flagged but deliberately not
+  fixed here, out of scope). Live-verified with a real 15s `pg_sleep`
+  query: cancelled cleanly at 10s, logged, `last_evaluated_at` still
+  stamped so it backs off to its own cadence instead of being retried
+  every 30s tick, and the shared worker kept processing real-time matches
+  throughout without disruption.
+- **Module placement**: went with a new `app/query_rule/` module
+  (`models.py`/`repository.py`/`service.py`/`api.py`, no `docker.py` --
+  no container to deploy), mirroring `app/automater/`'s shape per the
+  original leaning.
+
+**What shipped, across four phases (each independently tested + live-
+verified before moving to the next):**
+
+1. **Backend core** — the `Event`/`Occurrence` discriminator fields above,
+   `app/query_rule/` CRUD module, `EventRepository.resolve_occurrence`
+   guarded to skip its Redis firing-key deletion for `query_rule`-sourced
+   matches (no Go-managed key ever exists for one).
+2. **Backend evaluation** — `TelemetryRepository.execute_match_query` (no
+   `OFFSET`-wrapping unlike the Panel path — a Query Rule needs every
+   currently-matching row, not a windowed tail); `QueryRuleService.
+   evaluate()`'s match/clear diff (current SQL result set vs. currently-
+   open occurrences, keyed by `identifiers`; skips auto-clear entirely for
+   `resolve_mode=manual`, mirroring `rule.go`); `evaluate_due()` checking
+   each rule's own `interval`/`cron` schedule (via a new `croniter`
+   dependency for real cron semantics); one fixed 30s Celery Beat tick
+   (`app/query_rule/tasks.py`) rather than a dynamic per-rule scheduler
+   that doesn't exist in this stack. Runs on the **same** `celery-worker`
+   as real-time matches (deliberate choice, not a gap — see below). New
+   `app/celery_app.py` module, needed to break a circular import between
+   the two task modules. Live-verified with a real time-windowed aggregate
+   rule against the `data-sources-showcase` stack: fired 3 correct
+   `active` Occurrences matching direct TimescaleDB queries, didn't
+   duplicate on repeat ticks, and cleared correctly when the condition
+   stopped holding.
+3. **Backend AI** — `build_query_rule_sql_prompt` (`app/ai/prompts.py`),
+   deliberately the opposite framing from the Panel prompt in two ways:
+   one row per matching entity via `GROUP BY`/`HAVING` (not one row per
+   raw reading), and a hardcoded relative time window (`now() - interval
+   '5 minutes'`) instead of `$__timeFrom`/`$__timeTo` macros (there's no
+   dashboard time range here). New `POST /api/ai/query-rule-sql`. Live-
+   verified against the real Ollama model with both a single-table and a
+   genuinely cross-metric two-`HAVING`-clause prompt; saved the AI's own
+   output as a real `QueryRule` and confirmed its (zero-match) result
+   against a direct Postgres query.
+4. **Frontend** — a `NlSqlBuilder` component extracted out of
+   `PanelBuilder.tsx` (previously inline JSX + local state), reused by
+   both `PanelBuilder` and the new `QueryRuleEditor`; new `QueryRuleEditor`/
+   `QueryRuleList` pages; a two-card `CreateAlertChooser` at `/rules/new`
+   (Real-time → `/automaters/new`, Scheduled → `/query-rules/new`) that
+   both list pages' "+ New Rule" buttons now route through; a "Query
+   Rules" sidebar nav item; `types/event.ts` nullability fix matching the
+   backend; `AutomaterEditor`'s "Dedup Identifiers" label renamed to
+   "Identifiers" to match the new form's field naming. Live browser
+   verification (Playwright) caught one real bug before it shipped: a
+   `<button>` nested inside a `<label>` for the schedule-mode toggle,
+   invalid HTML that also produced a garbled ARIA accessible name (the
+   hidden alignment-spacer span's text got concatenated into the button's
+   name) — fixed by using a plain `<div>` wrapper instead.
+
+**Worker isolation, decided explicitly, not just defaulted**: real-time
+`log_rule_match` and scheduled `evaluate_due_query_rules` share the one
+existing `celery-worker` process rather than getting a dedicated second
+worker/queue. Confirmed safe in practice, not just in theory, by the 15s
+`pg_sleep` timeout test above — the shared worker kept draining real-time
+matches the whole time. Revisit only if that stops holding at higher
+Query Rule volume, not preemptively.
+
+**Full test suite green throughout all four phases**: 341 backend tests
+(61 new across this feature), `tsc --noEmit`/`oxlint` clean on every
+touched frontend file.
 
 ## Automater fan-out strategy per data-source kind — http case DONE 2026-07-13
 
