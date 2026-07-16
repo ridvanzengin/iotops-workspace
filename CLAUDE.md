@@ -42,7 +42,7 @@ touching code there.
 - **IoTOps only ever consumes custom-telegraf's output as a pre-built Docker image, by tag** — it never imports custom-telegraf's Go code, and custom-telegraf never imports IoTOps's Python/TS code. No shared build context, no shared dependency graph.
 - **Why two repos, not one**: Go plugin development is a genuinely different toolchain/CI/release cadence than IoTOps's Python+TS stack — see custom-telegraf's own README for the fuller reasoning.
 - **Why this workspace repo exists, not a merged monorepo**: solves "one Claude Code session needs filesystem access to both repos" without permanently coupling two unrelated build pipelines. Modeled on the `agritwin` project's own root-repo pattern (`~/personal/agritwin`); each sub-repo is nested as a nested-but-independently-git-tracked subdirectory rather than a true filesystem sibling.
-- **Milestone status**: IoTOps v1 (Milestones 0-4) is shipped. Milestone 5 (Automation Engine, v1.1) is done and substantially extended beyond its original scope — real rule/Redis/Celery logic in both custom-telegraf plugins, IoTOps's Automater backend + frontend, automated tests in both repos, a persisted events feature (Mongo-backed, SSE-delivered, sidebar activity-bar, Panel-chart overlay), and Query Rules (scheduled SQL-based cross-table detection) are all shipped. Next up: a public portfolio demo deployment, not further features. See `IoTOps/docs/development-plan.md` for the authoritative current status and `IoTOps/CHANGELOG.md` for dated history — this repo's own `ROADMAP.md` is a redirect stub now, kept only so old code comments pointing at it still resolve to something.
+- **Milestone status**: IoTOps v1 (Milestones 0-4) is shipped. Milestone 5 (Automation Engine, v1.1) is done and substantially extended beyond its original scope — real rule/Redis/Celery logic in both custom-telegraf plugins, IoTOps's Automater backend + frontend, automated tests in both repos, a persisted events feature (Mongo-backed, SSE-delivered, sidebar activity-bar, Panel-chart overlay), and Query Rules (scheduled SQL-based cross-table detection) are all shipped. The public portfolio demo is also done — live at https://iotops.online as of 2026-07-16, all 3 demo scenarios (including Kafka) working end to end, on branch `deploy/production-setup` (not yet merged to `main`). See `IoTOps/docs/development-plan.md` for the authoritative current status and `IoTOps/CHANGELOG.md` for dated history — this repo's own `ROADMAP.md` is a redirect stub now, kept only so old code comments pointing at it still resolve to something.
 
 ## Bandwidth is sometimes scarce — check local caches before downloading
 
@@ -73,7 +73,7 @@ pull data over the network, check whether it's actually needed first:
 **Read [`IoTOps/docs/development-plan.md`](IoTOps/docs/development-plan.md)
 before starting new feature work** — it has the phased plan (v1 through
 v1.2 and beyond), current milestone status, a Known Issues section, and
-the concrete Portfolio Demo Deployment section (the actual next step, not
-a new milestone). Update it as steps complete or decisions get made —
-treat it as living state, not a frozen plan, same convention this file's
-own `ROADMAP.md` used to follow before its content moved there.
+the Portfolio Demo Deployment section (done — see its own status note).
+Update it as steps complete or decisions get made — treat it as living
+state, not a frozen plan, same convention this file's own `ROADMAP.md`
+used to follow before its content moved there.
