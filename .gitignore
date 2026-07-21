@@ -1,6 +1,6 @@
-# IoTOps/ and custom-telegraf/ are siblings of this repo (one level up —
-# see README), never nested inside it. Defensive only: if either ever gets
-# cloned inside this folder by mistake, don't let this repo track it.
+# IoTOps/ and custom-telegraf/ are independent git repos nested inside
+# this one (see README/CLAUDE.md) — don't let this repo track their
+# contents.
 IoTOps/
 custom-telegraf/
 
