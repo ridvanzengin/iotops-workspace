@@ -8,13 +8,12 @@ A thin coordination repo for two independent sibling projects:
   custom Telegraf build bundling IoTOps's Automater plugins.
 
 This repo does **not** contain either project's code — clone them as
-siblings of this directory:
+independently git-tracked subdirectories nested inside this one:
 
 ```
-personal/
-├── iotops-workspace/   (this repo)
-├── IoTOps/
-└── custom-telegraf/
+iotops-workspace/         (this repo)
+├── IoTOps/                (own git remote/history)
+└── custom-telegraf/       (own git remote/history)
 ```
 
 See [`CLAUDE.md`](CLAUDE.md) for the cross-repo routing guide (which repo
